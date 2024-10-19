@@ -1,3 +1,4 @@
+import json
 import discord
 from discord.ext import commands
 import os
@@ -10,6 +11,9 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # Placeholder for tasks and submissions
 tasks = {}
 submissions = {}
+
+config_file = open("config.json")
+config = json.load(config_file)
 
 @bot.event
 async def on_ready():
@@ -76,4 +80,4 @@ async def assign_points(ctx, task_id: int, team_id: int, points: int):
     else:
         await ctx.send('Task or team not found.')
 
-bot.run(os.getenv('YOUR_BOT_TOKEN'))  # Use your bot token
+bot.run(os.getenv(config["bot_token"]))  # Use your bot token
