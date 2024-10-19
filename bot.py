@@ -19,17 +19,23 @@ config = json.load(config_file)
 async def on_ready():
     print(f'Logged in as {bot.user}!')
 
+
 # Command to assign a task
 @bot.command()
-async def assign_task(ctx, task_id: int, *, task_description: str):
-    """Assign a task to all teams."""
+async def assign_task(ctx, task_id: int, task_type: str, *, task_description: str):
+    """Assign a task to all teams with a specified type (time-sensitive, destination, all-day)."""
+    if task_type not in ['time-sensitive', 'destination', 'all-day']:
+        await ctx.send("Invalid task type. Please use 'time-sensitive', 'destination', or 'all-day'.")
+        return
+
     tasks[task_id] = {
         'description': task_description,
-        'type': 'destination',  # Placeholder for task type
+        'type': task_type,
         'submissions': {},
         'points': 0
     }
-    await ctx.send(f'Task {task_id} assigned: {task_description}')
+    await ctx.send(f'Task {task_id} assigned ({task_type}): {task_description}')
+
 
 # Command for teams to submit a task
 @bot.command()
@@ -37,10 +43,10 @@ async def submit_task(ctx, task_id: int):
     """Teams submit their task submissions."""
     if ctx.author.id not in submissions:
         submissions[ctx.author.id] = {}
-    
+
     if task_id in tasks:
         await ctx.author.send('Please send your submission (image/video).')
-        
+
         def check(m):
             return m.author == ctx.author and (m.attachments or m.content)
 
@@ -65,10 +71,13 @@ async def submit_task(ctx, task_id: int):
 async def check_submissions(ctx, task_id: int):
     """Check all submissions for a specific task."""
     if task_id in tasks:
-        submission_list = "\n".join([f'Team {bot.get_user(team_id).name}: {url}' for team_id, url in submissions.items() if task_id in submissions[team_id]])
+        submission_list = "\n".join(
+            [f'Team {bot.get_user(team_id).name}: {url}' for team_id, url in submissions.items() if
+             task_id in submissions[team_id]])
         await ctx.send(f'Submissions for Task {task_id}:\n{submission_list}')
     else:
         await ctx.send('Task not found.')
+
 
 # Command to assign points
 @bot.command()
