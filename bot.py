@@ -1,220 +1,513 @@
 import json
-import typing
-from typing import List
-import sqlite3
 
 import discord
+import requests
 from discord import app_commands
 from discord.ext import commands
-import os
+from discord.ui import Button, View
 
-# Intents and bot setup
+import asyncio
+import sqlite3
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+# Initialize bot
 intents = discord.Intents.default()
 intents.messages = True
-intents.message_content = True  # Enable this for reading messages
-bot = commands.Bot(command_prefix='!', intents=intents)
+intents.message_content = True
+intents.guilds = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
-# Placeholder for tasks and submissions
-tasks = {}
-submissions = {}
+Game_status = 0
+leaderboard_visible = True
 
 # Load configuration file
 config_file = open("config.json")
 config = json.load(config_file)
+# Database setup
+db = sqlite3.connect("game.db")
+cursor = db.cursor()
 
-# Database setup (SQLite for simplicity)
-conn = sqlite3.connect('teams.db')
-cursor = conn.cursor()
-member_id_next = 1
-# Create a table to store team info (if it doesn't exist)
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS teams (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    team_name TEXT NOT NULL,
-    members TEXT NOT NULL,
-    points INTEGER NOT NULL
-)
-''')
-conn.commit()
+cursor.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, discord_id INTEGER, team_id INTEGER)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS teams (id INTEGER PRIMARY KEY, name TEXT, points INTEGER)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, location INTEGER, description TEXT, points INTEGER)''')
+cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
+    id INTEGER PRIMARY KEY,
+    team_id INTEGER,
+    task_id INTEGER,
+    message_id INTEGER,
+    status TEXT,
+    photo_url TEXT,
+    UNIQUE(team_id, task_id)
+)''')
 
-# Setup hook to sync slash commands
+db.commit()
+
+# Google Sheets setup
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+credentials = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+client = gspread.authorize(credentials)
+
+def load_tasks_from_sheet(sheet_name):
+    try:
+        sheet = client.open(sheet_name).sheet1
+        tasks = sheet.get_all_records()
+        for task in tasks:
+            location = task["Location"]
+            description = task["Description"]
+            points = task["Points"]
+            cursor.execute("INSERT INTO tasks (location, description, points) VALUES (?, ?, ?)", (location, description, points))
+        db.commit()
+        return True
+    except Exception as e:
+        print(f"Error loading tasks from sheet: {e}")
+        return False
+
+# Helper functions
+
+async def send_to_channel_review(interaction: discord.Interaction ,channel_id: int, task_id:int,  photo_url:str):
+    await interaction.response.defer()
+    channel = bot.get_channel(channel_id)
+    task_description = get_task_by_id(task_id)
+    await interaction.followup.send(task_description)
+    await channel.send(photo_url)
+
+async def get_task_by_id(task_id):
+    cursor.execute("SELECT id, location, description, points FROM tasks WHERE id = ?", (task_id,))
+    result = cursor.fetchone()
+    return result
+
+
+def get_tasks(location):
+    cursor.execute("SELECT id, description, points FROM tasks WHERE location = ?", (location,))
+    return cursor.fetchall()
+
+def update_points(team_id, points):
+    cursor.execute("UPDATE teams SET points = points + ? WHERE id = ?", (points, team_id))
+    db.commit()
+def add_user_to_team(user_id, team_id):
+    cursor.execute("INSERT INTO users (discord_id, team_id) VALUES (?, ?)", (user_id, team_id))
+    db.commit()
+
+# Pagination class
+class TaskPaginator:
+    def __init__(self, tasks, per_page=1):
+        self.tasks = tasks
+        self.per_page = per_page
+        self.page = 0
+
+    def get_page(self):
+        start = self.page * self.per_page
+        end = start + self.per_page
+        return self.tasks[start:end]
+
+    def has_next(self):
+        return (self.page + 1) * self.per_page < len(self.tasks)
+
+    def has_previous(self):
+        return self.page > 0
+
+    def next_page(self):
+        if self.has_next():
+            self.page += 1
+
+    def previous_page(self):
+        if self.has_previous():
+            self.page -= 1
+
+# Event listeners
 @bot.event
 async def setup_hook():
     try:
         synced = await bot.tree.sync()
         print("Synced Commands: " + str(synced))
     except Exception as e:
-        print(f"Error syncing commands: {e}")
+        print("Booooof Something went wrong")
 
-# Ready event
 @bot.event
 async def on_ready():
-    print("Road Rally Bot is running")
+    print(f"Bot logged in as {bot.user}")
 
-# Slash command to assign a task
-@bot.tree.command(name="assign_task")
-@app_commands.describe(task_id="The task ID", task_type="The type of task", task_description="Description of the task")
-async def assign_task(interaction: discord.Interaction, task_id: int, task_type: str, task_description: str):
-    """Assign a task to all teams with a specified type (time-sensitive, destination, all-day)."""
-    if task_type not in ['time-sensitive', 'destination', 'all-day']:
-        await interaction.response.send_message("Invalid task type. Please use 'time-sensitive', 'destination', or 'all-day'.")
-        return
-
-    tasks[task_id] = {
-        'description': task_description,
-        'type': task_type,
-        'submissions': {},
-        'points': 0
-    }
-    await interaction.response.send_message(f'Task {task_id} assigned ({task_type}): {task_description}')
-
-# Slash command for teams to submit a task
-@bot.tree.command(name="submit_task")
-@app_commands.describe(task_id="The task ID you are submitting for")
-async def submit_task(interaction: discord.Interaction, task_id: int):
-    """Teams submit their task submissions."""
-
-    if interaction.user.id not in submissions:
-        submissions[interaction.user.id] = {}
-
-    if task_id in tasks:
-        await interaction.user.send('Please send your submission (image/video).')
-
-        def check(m):
-            return m.author == interaction.user and (m.attachments or m.content)
-
-        msg = await bot.wait_for('message', check=check)
-
-        if msg.attachments:
-            for attachment in msg.attachments:
-                submissions[interaction.user.id][task_id] = attachment.url
-
-            await interaction.user.send('Submission received!')
-
-            # Notify the moderator
-            moderator_channel = bot.get_channel(config["moderator_channel"])  # Replace with actual channel ID
-            await moderator_channel.send(f'Team {interaction.user.name} submitted for task {task_id}: {attachment.url}')
-            await interaction.response.send_message(f"Submission received for task {task_id}", ephemeral=True)
-        else:
-            await interaction.user.send('Please send an attachment or a valid message.')
-    else:
-        await interaction.response.send_message('Task not found.', ephemeral=True)
-
-# Slash command for the moderator to check submissions
-@bot.tree.command(name="check_submissions")
-@app_commands.describe(task_id="The task ID to check submissions for")
-async def check_submissions(interaction: discord.Interaction, task_id: int):
-    """Check all submissions for a specific task."""
-    if task_id in tasks:
-        submission_list = "\n".join(
-            [f'Team {team_id}: {url}' for team_id, url in submissions.items() if task_id in submissions[team_id]])
-        if submission_list:
-            await interaction.response.send_message(f'Submissions for Task {task_id}:\n{submission_list}')
-        else:
-            await interaction.response.send_message(f'No submissions found for Task {task_id}.')
-    else:
-        await interaction.response.send_message('Task not found.')
-
-# Slash command to assign points
-@bot.tree.command(name="assign_points")
-@app_commands.describe(task_id="The task ID", team_id="The team ID", points="Points to assign")
-async def assign_points(interaction: discord.Interaction, task_id: int, team_id: int, points: int):
-    """Assign points to a team for a specific task."""
-    if task_id in tasks and team_id in submissions:
-        tasks[task_id]['submissions'][team_id] = points
-        await interaction.response.send_message(f'Assigned {points} points to Team {bot.get_user(team_id).name} for Task {task_id}.')
-    else:
-        await interaction.response.send_message('Task or team not found.')
-
-
-# Database setup remains the same
-
-# Register the slash commands for creating teams
-@bot.tree.command(name="create_team")
-@app_commands.describe(team_name="The name of the team", member1="Select the team members")
-async def create_team(interaction: discord.Interaction, team_name: str, member1: discord.User, member2: discord.User = None, member3: discord.User = None, member4: discord.User = None, member5: discord.User = None, member6: discord.User = None):
-    """Create a team with the given name and list of members."""
-    # Ensure the command is only used in a specific server
-    if interaction.guild.roles is None:
-        await interaction.response.send_message("Can't see it here bud, mf", ephemeral=True)
-
-    moderator_role = discord.utils.get(interaction.guild.roles, name="Moderator")
-    if moderator_role not in interaction.user.roles:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    # Check if the user has the "Moderator" role
-    moderator_role = discord.utils.get(interaction.guild.roles, name="Moderator")
-    if moderator_role not in interaction.user.roles:
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    # Create a list of member names to display
-
-    member_names = [member1, member2, member3, member4, member5, member6]
-    member_id = [str(member.id) for member in member_names if member is not None]
-    member_names = [member.display_name for member in member_names if member is not None]
-
-
+# Slash commands
+@tree.command(name="create_team", description="Create a new team")
+@app_commands.describe(team_name="The name of the team")
+async def create_team(interaction: discord.Interaction, team_name: str, user1: discord.Member, user2: discord.Member = None, user3: discord.Member = None, user4: discord.Member = None, user5: discord.Member = None, user6: discord.Member = None):
+    await interaction.response.defer()
     try:
-        # Insert the team into the teams table
-        cursor.execute("""
-                 INSERT INTO teams (team_name, members, points)
-                 VALUES (?, ?, ?)
-             """, (team_name, ', '.join(member_id), 0
-                   ))
+        if not any(role.name == "Game Admin" for role in interaction.user.roles):
+            await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+            return
+    except AttributeError:
+        await interaction.followup.send("Can't use Command in DM", ephemeral=True)
+        return
+    users = [user1, user2, user3, user4, user5, user6]
 
-        # Commit the transaction
-        conn.commit()
+    cursor.execute("INSERT INTO teams (name, points) VALUES (?, 0)", (team_name,))
+    team_id = cursor.lastrowid
+    for user in users:
+        if user is None:
+            break
+        add_user_to_team(user.id, team_id)
 
-        await interaction.response.send_message(
-            f"Team '{team_name}' created with members: {', '.join(member_names)}"
+    db.commit()
+    await interaction.followup.send(f"Team '{team_name}' created successfully!")
+
+@tree.command(name="start_game", description="Start the game for a specific location")
+@app_commands.describe(location="The location ID to start")
+async def start_game(interaction: discord.Interaction, location: int):
+    await interaction.response.defer()
+    try:
+        if not any(role.name == "Game Admin" for role in interaction.user.roles):
+            await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+            return
+    except AttributeError:
+        await interaction.followup.send("Can't use Command in DM", ephemeral=True)
+        return
+    tasks = get_tasks(location)
+    if not tasks:
+        await interaction.followup.send("No tasks available for this location.")
+        return
+    global Game_status
+    Game_status = location
+    await interaction.followup.send(f"Game started for location {location}!")
+
+@tree.command(name="load_tasks", description="Load tasks from a Google Sheet")
+@app_commands.describe(sheet_name="The name of the Google Sheet to load tasks from")
+async def load_tasks(interaction: discord.Interaction, sheet_name: str):
+    await interaction.response.defer()
+    try:
+        if not any(role.name == "Game Admin" for role in interaction.user.roles):
+            await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
+            return
+    except AttributeError:
+        await interaction.followup.send("Can't use Command in DM", ephemeral=True)
+        return
+
+    success = load_tasks_from_sheet(sheet_name)
+    if success:
+        await interaction.followup.send(f"Tasks loaded successfully from {sheet_name}.")
+    else:
+        await interaction.followup.send(f"Failed to load tasks from {sheet_name}.")
+
+
+
+@tree.command(name="my_tasks", description="View your tasks for the current location")
+async def my_tasks(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    user_id = interaction.user.id
+    cursor.execute("SELECT team_id FROM users WHERE discord_id = ?", (user_id,))
+    result = cursor.fetchone()
+    if not result:
+        await interaction.followup.send("You are not assigned to a team!", ephemeral=True)
+        return
+
+    team_id = result[0]
+    global Game_status
+    tasks = get_tasks(Game_status)
+
+    if not tasks:
+        await interaction.followup.send("No tasks available for your location.", ephemeral=True)
+        return
+
+    paginator = TaskPaginator(tasks)
+    embed = discord.Embed(title="Tasks", description="Here are your tasks:")
+    for task in paginator.get_page():
+        embed.add_field(name=f"Task ID: {task[0]}", value=f"{task[1]} ({task[2]} points)", inline=False)
+
+    # Define navigation buttons
+    class TaskView(View):
+        def __init__(self):
+            super().__init__()
+            self.current_task_index = 0
+
+        @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary)
+        async def previous_button(self, interaction: discord.Interaction, button: Button):
+            if paginator.has_previous():
+                paginator.previous_page()
+                embed.clear_fields()
+                for task in paginator.get_page():
+                    embed.add_field(name=f"Task ID: {task[0]}", value=f"{task[1]} ({task[2]} points)", inline=False)
+                await interaction.response.edit_message(embed=embed)
+
+        @discord.ui.button(label="✅ Submit", style=discord.ButtonStyle.primary)
+        async def submit_button(self, interaction: discord.Interaction, button: Button):
+            current_task = paginator.get_page()[self.current_task_index]
+            task_id = current_task[0]
+            await submit_task(interaction, task_id)
+
+        @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary)
+        async def next_button(self, interaction: discord.Interaction, button: Button):
+            if paginator.has_next():
+                paginator.next_page()
+                embed.clear_fields()
+                for task in paginator.get_page():
+                    embed.add_field(name=f"Task ID: {task[0]}", value=f"{task[1]} ({task[2]} points)", inline=False)
+                await interaction.response.edit_message(embed=embed)
+
+    view = TaskView()
+    await interaction.followup.send(embed=embed, view=view)
+
+
+
+
+async def submit_task(interaction: discord.Interaction, task_id: int):
+    user_id = interaction.user.id
+    cursor.execute("SELECT id, team_id FROM users WHERE discord_id = ?", (user_id,))
+    result = cursor.fetchone()
+    if not result:
+        await interaction.followup.send("You are not registered!", ephemeral=True)
+        return
+
+    user_db_id, team_id = result
+
+    # Check for existing submission
+    cursor.execute("SELECT status, message_id FROM submissions WHERE team_id = ? AND task_id = ?", (team_id, task_id))
+    existing_submission = cursor.fetchone()
+
+    action_message = "submitted"
+    overwrite = False
+    message_id = None
+
+    if existing_submission:
+        status, message_id = existing_submission
+        if status == "Accepted":
+            await interaction.response.send_message(
+                "Your submission for this task has already been accepted. Resubmission is not allowed.", ephemeral=True
+            )
+            return
+        elif status in ("Pending", "Denied"):
+            overwrite = True
+            action_message = "resubmitted"
+
+        if overwrite and message_id:
+            try:
+                # Fetch the old message from the database
+                channel_id = config.get('moderator_channel')
+                channel = interaction.client.get_channel(channel_id)
+                if channel:
+                    old_message = await channel.fetch_message(message_id)
+                    if old_message:
+                        # Disable all buttons in the view
+                        for component in old_message.components:
+                            for item in component.children:
+                                item.disabled = True  # Disable the button
+
+                        # Create a new view with updated components
+                        updated_view = View()
+                        for component in old_message.components:
+                            for item in component.children:
+                                updated_view.add_item(item)
+
+                        # Edit the old message to update the view
+                        await old_message.edit(view=updated_view)
+            except Exception as e:
+                print(f"Error fetching or editing old message: {e}")
+
+    # Insert or update submission
+    cursor.execute(
+        """
+        INSERT INTO submissions (team_id, task_id, status, message_id, photo_url)
+        VALUES (?, ?, 'Pending', NULL, NULL)
+        ON CONFLICT(team_id, task_id)
+        DO UPDATE SET status = 'Pending', photo_url = NULL
+        """,
+        (team_id, task_id)
+    )
+    db.commit()
+
+    # Create and send the new submission view
+    submit_button = Button(label="Submit Photo", style=discord.ButtonStyle.primary)
+
+    async def handle_photo_submission(interaction: discord.Interaction):
+        submitter = await interaction.client.fetch_user(user_id)
+        await interaction.response.send_message(f"Please upload your photo to be {action_message}:", ephemeral=True)
+
+        def check(msg):
+            return msg.author == interaction.user and len(msg.attachments) > 0
+
+        try:
+            msg = await interaction.client.wait_for("message", check=check, timeout=300)  # 5-minute timeout
+        except asyncio.TimeoutError:
+            await interaction.followup.send("Photo submission timed out. Please try again.", ephemeral=True)
+            return
+
+        photo_url = msg.attachments[0].url
+
+        # Update the photo URL in the database
+        cursor.execute(
+            "UPDATE submissions SET photo_url = ?, status = 'Pending' WHERE team_id = ? AND task_id = ?",
+            (photo_url, team_id, task_id)
         )
+        db.commit()
+        await interaction.followup.send("Photo Submission Complete!", ephemeral=True)
 
-    except Exception as e:
-        await interaction.response.send_message(f"Error creating the team: {str(e)}", ephemeral=True)
-        conn.rollback()
-# Helper function to find which team a user belongs to (unchanged)
-def get_team_for_member(member_id):
-    cursor.execute('SELECT team_name FROM teams WHERE member_id = ?', (str(member_id),))
-    team = cursor.fetchone()
-    if team:
-        return team[0]
-    return None
+        # Notify the server channel with Accept and Deny buttons
+        channel_id = config.get('moderator_channel')
+        channel = interaction.client.get_channel(channel_id)
+        if channel:
+            embed = discord.Embed(
+                title=f"Task {action_message.capitalize()}",
+                description=f"New {action_message} for task {task_id}"
+            )
+            embed.add_field(name="Team ID", value=team_id, inline=True)
+            embed.add_field(name="Submitted By", value=interaction.user.mention, inline=True)
+
+            def is_video_url(url):
+                response = requests.head(url)
+                content_type = response.headers.get('Content-Type', '')
+                return 'video' in content_type
+            is_video = is_video_url(photo_url)
+            if is_video:
+                embed.add_field(name="Video Submission",
+                                value=photo_url, inline=True)
+
+            else:
+                embed.set_image(url=photo_url)
 
 
-# Slash command for task submission
-@bot.tree.command(name="submit_task_team", description="Submit a task for your team")
-@discord.app_commands.describe(task_id="ID of the task you are submitting")
-async def submit_task_team(interaction: discord.Interaction, task_id: int):
-    # Get the user's team
-    team_name = get_team_for_member(interaction.user.id)
 
-    if team_name:
-        await interaction.response.send_message(f'Team "{team_name}" submitted task {task_id}.')
+            review_view = View()
+
+            # Accept Button
+            async def accept_callback(interaction: discord.Interaction):
+                if not "Game Admin" in interaction.user.roles:
+                    await interaction.response.send_message("You are not authorized to perform this action.",
+                                                            ephemeral=True)
+                    return
+
+                cursor.execute("UPDATE submissions SET status = 'Accepted' WHERE team_id = ? AND task_id = ?",
+                               (team_id, task_id))
+                id, location, description, points = await get_task_by_id(task_id)
+                cursor.execute("UPDATE teams SET points = points + ? WHERE id = ?", (points, team_id))
+                db.commit()
+                await interaction.response.send_message("Submission accepted and points added.", ephemeral=True)
+
+                # Disable all buttons
+                for child in review_view.children:
+                    child.disabled = True
+                await interaction.message.edit(view=review_view)
+
+            accept_button = Button(label="Accept", style=discord.ButtonStyle.success)
+            accept_button.callback = accept_callback
+            review_view.add_item(accept_button)
+
+            # Deny Button
+            async def deny_callback(interaction: discord.Interaction):
+                if not any(role.name == "Game Admin" for role in interaction.user.roles):
+                    await interaction.response.send_message("You are not authorized to perform this action.",
+                                                            ephemeral=True)
+                    return
+
+                await interaction.response.send_message("Please provide a reason for denial:", ephemeral=True)
+
+                def check(msg):
+                    return msg.author == interaction.user
+
+                try:
+                    msg = await interaction.client.wait_for("message", check=check, timeout=300)  # 5-minute timeout
+                except asyncio.TimeoutError:
+                    await interaction.followup.send("Timed out while waiting for denial reason.", ephemeral=True)
+                    return
+
+                denial_reason = msg.content
+                cursor.execute("UPDATE submissions SET status = 'Denied' WHERE team_id = ? AND task_id = ?",
+                               (team_id, task_id))
+                db.commit()
+
+                await submitter.send(f"Submission denied for Task ID {task_id}. Reason: {denial_reason}")
+                await interaction.followup.send("Submission denied.", ephemeral=True)
+
+                # Disable all buttons
+                for child in review_view.children:
+                    child.disabled = True
+                await interaction.message.edit(view=review_view)
+
+            deny_button = Button(label="Deny", style=discord.ButtonStyle.danger)
+            deny_button.callback = deny_callback
+            review_view.add_item(deny_button)
+
+            try:
+                if is_video:
+                    await channel.send(photo_url)
+                new_message = await channel.send(embed=embed, view=review_view)
+
+                # Update the new message ID in the database
+                cursor.execute(
+                    "UPDATE submissions SET message_id = ? WHERE team_id = ? AND task_id = ?",
+                    (new_message.id, team_id, task_id)
+                )
+                db.commit()
+            except discord.NotFound:
+                await interaction.followup.send("Failed to post the message for review.", ephemeral=True)
+
+    submit_button.callback = handle_photo_submission
+
+    main_view = View()
+    main_view.add_item(submit_button)
+
+    await interaction.response.send_message(f"Task ready for {action_message}. Please submit your photo:", view=main_view, ephemeral=True)
+
+@tree.command(name="toggle_leaderboard", description="Toggle the visibility of the leaderboard")
+async def toggle_leaderboard(interaction: discord.Interaction):
+    if "Game Admin" in interaction.user.roles:
+        await interaction.response.send_message("You are not authorized to toggle the leaderboard visibility.", ephemeral=True)
+        return
+
+    global leaderboard_visible
+
+    # Toggle the visibility state
+    leaderboard_visible = not leaderboard_visible
+
+    # Inform the admin about the current visibility
+    if leaderboard_visible:
+        await interaction.response.send_message("The leaderboard is now visible to teams.", ephemeral=True)
     else:
-        await interaction.response.send_message("You are not part of any team!", ephemeral=True)
+        await interaction.response.send_message("The leaderboard is now hidden from teams.", ephemeral=True)
+def fetch_leaderboard():
+    # Get all teams sorted by points in descending order
+    cursor.execute("SELECT name, points FROM teams ORDER BY points DESC")
+    leaderboard = cursor.fetchall()
+    return leaderboard
 
 
-# Slash command to list all teams (moderator only)
-@bot.tree.command(name="list_teams", description="List all the teams")
-async def list_teams(interaction: discord.Interaction):
-    # Check if the user has the "Moderator" role
+@tree.command(name="leaderboard", description="View the current leaderboard")
+async def leaderboard(interaction: discord.Interaction):
+    # Ensure only the Game Admin can view the leaderboard
+    await interaction.response.defer()
+    leaderboard = fetch_leaderboard()
 
-    cursor.execute('SELECT DISTINCT team_name FROM teams')
-    teams = cursor.fetchall()
-    if teams:
-        team_list = '\n'.join([team[0] for team in teams])
-        await interaction.response.send_message(f"Teams:\n{team_list}")
-    else:
-        await interaction.response.send_message("No teams have been created yet.", ephemeral=True)
+    if not leaderboard:
+        await interaction.followup.send("No teams have been registered yet.", ephemeral=True)
+        return
+    if not leaderboard_visible:
+        await interaction.followup.send("Leaderboard as been Disabled by game admin.", ephemeral=True)
+        return
+    # Create the embed for the leaderboard
+    embed = discord.Embed(
+        title="Leaderboard",
+        description="Here are the top teams for the current game!",
+        color=discord.Color.blurple()  # You can change the embed color
+    )
 
+    # Add the leaderboard content to the embed
+    for idx, (team_name, points) in enumerate(leaderboard):
+        # Emoji bar based on the team's points
+        bar = "🔹" * (points // 10)  # You can scale this based on the points
+        # Color code the top 3 positions
+        if idx == 0:  # First place: Gold
+            embed.add_field(name=f"🥇 {team_name}", value=f"{points} points {bar}", inline=False)
+        elif idx == 1:  # Second place: Silver
+            embed.add_field(name=f"🥈 {team_name}", value=f"{points} points {bar}", inline=False)
+        elif idx == 2:  # Third place: Bronze
+            embed.add_field(name=f"🥉 {team_name}", value=f"{points} points {bar}", inline=False)
+        else:  # Other positions
+            embed.add_field(name=team_name, value=f"{points} points {bar}", inline=False)
 
-# Sync the slash commands with Discord when bot is ready
-@bot.event
-async def on_ready():
-    await bot.tree.sync(guild=discord.Object(id=config["server_id"]))  # Sync the slash commands to your specific server
-    print(f'Bot {bot.user} is ready and slash commands are synced.')
+    # Send the leaderboard embed
+    await interaction.followup.send(embed=embed)
 
+bot.run(config['bot_token'])
 
-bot.run(config["bot_token"])  # Use your bot token from config
