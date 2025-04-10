@@ -56,8 +56,8 @@ def load_tasks_from_sheet(sheet_name):
             location = task["Location"]
             description = task["Description"]
             points = task["Points"]
-            # TODO: If Judge is 1 then on accept it uses the point total as the max total
-            # and when I press accept it prompts me for a score to give; if it's higher than the max point total it reprompts.
+            # If Judge is 1 then on accept it uses the point total as the max total
+            # and when the accept button is pressed it prompts for a score; if higher than the max it reprompts.
             judge = task["Judge"]
             cursor.execute("INSERT INTO tasks (location, description, points, judge) VALUES (?, ?, ?, ?)", (location, description, points, judge))
         db.commit()
@@ -85,8 +85,9 @@ async def send_to_channel_review(interaction: discord.Interaction, channel_id: i
     await interaction.followup.send(task_description)
     await channel.send(photo_url)
 
+# Modified to include the judge column.
 async def get_task_by_id(task_id):
-    cursor.execute("SELECT id, location, description, points FROM tasks WHERE id = ?", (task_id,))
+    cursor.execute("SELECT id, location, description, points, judge FROM tasks WHERE id = ?", (task_id,))
     result = cursor.fetchone()
     return result
 
@@ -101,32 +102,6 @@ def update_points(team_id, points):
 def add_user_to_team(user_id, team_id):
     cursor.execute("INSERT INTO users (discord_id, team_id) VALUES (?, ?)", (user_id, team_id))
     db.commit()
-
-# Pagination class remains unchanged for now.
-class TaskPaginator:
-    def __init__(self, tasks, per_page=1):
-        self.tasks = tasks
-        self.per_page = per_page
-        self.page = 0
-
-    def get_page(self):
-        start = self.page * self.per_page
-        end = start + self.per_page
-        return self.tasks[start:end]
-
-    def has_next(self):
-        return (self.page + 1) * self.per_page < len(self.tasks)
-
-    def has_previous(self):
-        return self.page > 0
-
-    def next_page(self):
-        if self.has_next():
-            self.page += 1
-
-    def previous_page(self):
-        if self.has_previous():
-            self.page -= 1
 
 # Event listeners
 @bot.event
@@ -146,12 +121,10 @@ async def on_ready():
 @app_commands.describe(team_name="The name of the team")
 async def create_team(interaction: discord.Interaction, team_name: str, user1: discord.Member, user2: discord.Member = None, user3: discord.Member = None, user4: discord.Member = None, user5: discord.Member = None, user6: discord.Member = None):
     await interaction.response.defer()
-    # TODO: CHECK IF USER IS ALREADY ON TEAM. IF THEY ARE, DO NOT ADD THEM TO TEAM.
-
+    # Check if the user invoking this command has the Game Admin role
     try:
         if interaction.guild is None:
-            await interaction.followup.send("You are not authorized to toggle the leaderboard visibility.",
-                                                    ephemeral=True)
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
             return
         if not any(role.name == "Game Admin" for role in interaction.user.roles):
             await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
@@ -161,15 +134,28 @@ async def create_team(interaction: discord.Interaction, team_name: str, user1: d
         return
     users = [user1, user2, user3, user4, user5, user6]
 
+    # Create the team first.
     cursor.execute("INSERT INTO teams (name, points) VALUES (?, 0)", (team_name,))
     team_id = cursor.lastrowid
+
+    # Check each provided user and only add them if they're not already on a team.
+    duplicate_users = []
+    valid_users = []
     for user in users:
         if user is None:
             break
-        add_user_to_team(user.id, team_id)
+        cursor.execute("SELECT team_id FROM users WHERE discord_id = ?", (user.id,))
+        if cursor.fetchone():
+            duplicate_users.append(user.name)
+        else:
+            add_user_to_team(user.id, team_id)
+            valid_users.append(user.name)
 
     db.commit()
-    await interaction.followup.send(f"Team '{team_name}' created successfully!")
+    response = f"Team '{team_name}' created successfully!\nAdded members: {', '.join(valid_users) if valid_users else 'None'}."
+    if duplicate_users:
+        response += f"\nSkipped (already on a team): {', '.join(duplicate_users)}."
+    await interaction.followup.send(response)
 
 @tree.command(name="start_game", description="Start the game for a specific location")
 @app_commands.describe(location="The location ID to start")
@@ -177,8 +163,7 @@ async def start_game(interaction: discord.Interaction, location: int):
     await interaction.response.defer()
     try:
         if interaction.guild is None:
-            await interaction.followup.send("You are not authorized to toggle the leaderboard visibility.",
-                                                    ephemeral=True)
+            await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
             return
         if not any(role.name == "Game Admin" for role in interaction.user.roles):
             await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
@@ -220,8 +205,7 @@ async def load_tasks(interaction: discord.Interaction, sheet_name: str):
     await interaction.response.defer()
     try:
         if interaction.guild is None:
-            await interaction.followup.send("You are not authorized to toggle the leaderboard visibility.",
-                                                    ephemeral=True)
+            await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
             return
         if not any(role.name == "Game Admin" for role in interaction.user.roles):
             await interaction.followup.send("You do not have permission to use this command.", ephemeral=True)
@@ -235,7 +219,6 @@ async def load_tasks(interaction: discord.Interaction, sheet_name: str):
         await interaction.followup.send(f"Tasks loaded successfully from {sheet_name}.")
     else:
         await interaction.followup.send(f"Failed to load tasks from {sheet_name}.")
-
 
 @tree.command(name="my_tasks", description="View your tasks for the current location along with their completion status")
 async def my_tasks(interaction: discord.Interaction):
@@ -279,7 +262,6 @@ async def my_tasks(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-
 @tree.command(name="submit", description="Submit your task photo using task ID")
 @app_commands.describe(task_id="The ID of the task you are submitting for")
 async def submit(interaction: discord.Interaction, task_id: int):
@@ -298,7 +280,7 @@ async def submit(interaction: discord.Interaction, task_id: int):
     if not task_info:
         await interaction.followup.send("Task not found.", ephemeral=True)
         return
-    _, task_location, _, _ = task_info
+    _, task_location, _, _, _ = task_info
     if task_location != Game_status:
         await interaction.followup.send("This task is not for the current game location.", ephemeral=True)
         return
@@ -422,7 +404,6 @@ async def submit(interaction: discord.Interaction, task_id: int):
         review_view = View()
 
         # Accept Button
-        # Accept Button
         async def accept_callback(interaction: discord.Interaction):
             if not any(role.name == "Game Admin" for role in interaction.user.roles):
                 await interaction.response.send_message("You are not authorized to perform this action.",
@@ -434,31 +415,57 @@ async def submit(interaction: discord.Interaction, task_id: int):
             current_status = cursor.fetchone()
             if current_status and current_status[0] == "Accepted":
                 await interaction.response.send_message("This task is already marked as done.", ephemeral=True)
+                for child in review_view.children:
+                    child.disabled = True
+                await interaction.message.edit(view=review_view)
                 return
 
-            # Otherwise, mark the submission as accepted
+            # Retrieve the task details including judge flag.
+            task_info = await get_task_by_id(task_id)
+            if not task_info:
+                await interaction.response.send_message("Task not found.", ephemeral=True)
+                return
+            _id, location, description, points, judge = task_info
+
+            # If judge is enabled, prompt for a custom score.
+            if judge == 1:
+                await interaction.response.send_message(f"Enter a score for this submission (max {points} points):", ephemeral=True)
+                def check_score(msg):
+                    return msg.author == interaction.user and msg.content.isdigit()
+                valid_score = None
+                while valid_score is None:
+                    try:
+                        score_msg = await interaction.client.wait_for("message", check=check_score, timeout=300)
+                        score = int(score_msg.content)
+                        if score > points:
+                            await interaction.followup.send(f"Score cannot exceed max points ({points}). Please try again.", ephemeral=True)
+                        else:
+                            valid_score = score
+                    except asyncio.TimeoutError:
+                        await interaction.response.send_message("Score submission timed out.", ephemeral=True)
+                        return
+                awarded_points = valid_score
+            else:
+                awarded_points = points
+
+            # Mark the submission as accepted and add the awarded points.
             cursor.execute("UPDATE submissions SET status = 'Accepted' WHERE team_id = ? AND task_id = ?",
                            (team_id, task_id))
-            task_info = await get_task_by_id(task_id)
-            if task_info:
-                id, location, description, points = task_info
-                cursor.execute("UPDATE teams SET points = points + ? WHERE id = ?", (points, team_id))
-                db.commit()
-                await interaction.response.send_message("Submission accepted and points added.", ephemeral=True)
+            cursor.execute("UPDATE teams SET points = points + ? WHERE id = ?", (awarded_points, team_id))
+            db.commit()
+            await interaction.response.send_message("Submission accepted and points added.", ephemeral=True)
 
-                # Send a DM to all team members informing them of the accepted submission.
-                cursor.execute("SELECT discord_id FROM users WHERE team_id = ?", (team_id,))
-                team_members = cursor.fetchall()
-                for (discord_id,) in team_members:
-                    try:
-                        team_user = await interaction.client.fetch_user(discord_id)
-                        await team_user.send(
-                            f"Team Update: Your submission for task ID {task_id} has been accepted! Your team has earned {points} points."
-                        )
-                    except Exception as e:
-                        print(f"Failed to send DM to user {discord_id}: {e}")
-            else:
-                await interaction.response.send_message("Task not found.", ephemeral=True)
+            # Send a DM to all team members informing them of the accepted submission.
+            cursor.execute("SELECT discord_id FROM users WHERE team_id = ?", (team_id,))
+            team_members = cursor.fetchall()
+            for (discord_id,) in team_members:
+                try:
+                    team_user = await interaction.client.fetch_user(discord_id)
+                    await team_user.send(
+                        f"Team Update: Your submission for task ID {task_id} has been accepted! Your team has earned {awarded_points} points."
+                    )
+                except Exception as e:
+                    print(f"Failed to send DM to user {discord_id}: {e}")
 
             # Disable all buttons in the review view
             for child in review_view.children:
@@ -474,6 +481,14 @@ async def submit(interaction: discord.Interaction, task_id: int):
             if not any(role.name == "Game Admin" for role in interaction.user.roles):
                 await interaction.response.send_message("You are not authorized to perform this action.",
                                                         ephemeral=True)
+                return
+            cursor.execute("SELECT status FROM submissions WHERE team_id = ? AND task_id = ?", (team_id, task_id))
+            current_status = cursor.fetchone()
+            if current_status and (current_status[0] == "Accepted" or current_status[0] == "Denied"):
+                await interaction.response.send_message("This task is already marked", ephemeral=True)
+                for child in review_view.children:
+                    child.disabled = True
+                await interaction.message.edit(view=review_view)
                 return
 
             await interaction.response.send_message("Please provide a reason for denial:", ephemeral=True)
@@ -516,7 +531,6 @@ async def submit(interaction: discord.Interaction, task_id: int):
             db.commit()
         except discord.NotFound:
             await interaction.followup.send("Failed to post the message for review.", ephemeral=True)
-
 
 @tree.command(name="toggle_leaderboard", description="Toggle the visibility of the leaderboard")
 async def toggle_leaderboard(interaction: discord.Interaction):
@@ -574,7 +588,6 @@ async def leaderboard(interaction: discord.Interaction):
 
     await interaction.followup.send(embed=embed)
 
-
 @tree.command(name="add_points", description="Add points to a team")
 @app_commands.describe(team_id="The ID of the team", points="Points to add")
 async def add_points(interaction: discord.Interaction, team_id: int, points: int):
@@ -613,7 +626,6 @@ async def add_points(interaction: discord.Interaction, team_id: int, points: int
             await team_user.send(f"Team Update: {points} points have been added to your team.\nReason: {reason}")
         except Exception as e:
             print(f"Failed to send DM to user {discord_id}: {e}")
-
 
 @tree.command(name="remove_points", description="Remove points from a team")
 @app_commands.describe(team_id="The ID of the team", points="Points to remove")
@@ -654,7 +666,6 @@ async def remove_points(interaction: discord.Interaction, team_id: int, points: 
         except Exception as e:
             print(f"Failed to send DM to user {discord_id}: {e}")
 
-
 @tree.command(name="list_teams", description="Private list of teams and their members")
 async def list_teams(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
@@ -687,6 +698,53 @@ async def list_teams(interaction: discord.Interaction):
         members_str = ", ".join(member_names) if member_names else "No members"
         response_message += f"**Team {team_name} (ID: {team_id}, Points: {points})**\nMembers: {members_str}\n\n"
     await interaction.followup.send(response_message, ephemeral=True)
+
+@tree.command(name="rename_team", description="Rename an existing team (Game Admin only)")
+@app_commands.describe(team_id="The ID of the team to rename", new_name="The new name for the team")
+async def rename_team(interaction: discord.Interaction, team_id: int, new_name: str):
+    await interaction.response.defer(ephemeral=True)
+    # Only allow command if used in a guild by a Game Admin
+    if interaction.guild is None or not any(role.name == "Game Admin" for role in interaction.user.roles):
+        await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+        return
+
+    # Check if the team exists
+    cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
+    team = cursor.fetchone()
+    if team is None:
+        await interaction.followup.send(f"Team with ID {team_id} not found.", ephemeral=True)
+        return
+
+    # Update the team's name in the database
+    cursor.execute("UPDATE teams SET name = ? WHERE id = ?", (new_name, team_id))
+    db.commit()
+    await interaction.followup.send(f"Team renamed successfully to '{new_name}'.", ephemeral=True)
+
+
+@tree.command(name="remove_team", description="Remove an existing team (Game Admin only)")
+@app_commands.describe(team_id="The ID of the team to remove")
+async def remove_team(interaction: discord.Interaction, team_id: int):
+    await interaction.response.defer(ephemeral=True)
+    # Only allow command if used in a guild by a Game Admin
+    if interaction.guild is None or not any(role.name == "Game Admin" for role in interaction.user.roles):
+        await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+        return
+
+    # Check if the team exists
+    cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
+    team = cursor.fetchone()
+    if team is None:
+        await interaction.followup.send(f"Team with ID {team_id} not found.", ephemeral=True)
+        return
+
+    # Delete the team and any associated users from the database
+    cursor.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+    cursor.execute("DELETE FROM users WHERE team_id = ?", (team_id,))
+    db.commit()
+    await interaction.followup.send(f"Team with ID {team_id} has been removed.", ephemeral=True)
+
+
+
 
 
 
