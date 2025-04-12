@@ -275,17 +275,18 @@ async def submit(interaction: discord.Interaction, task_id: int):
 
     user_db_id, team_id = result
 
-    # Retrieve the task and check if it's for the current game location
+    # Retrieve the task and check if it's for the current game location.
     task_info = await get_task_by_id(task_id)
     if not task_info:
         await interaction.followup.send("Task not found.", ephemeral=True)
         return
-    _, task_location, _, _, _ = task_info
+    # *** Modified: Unpack the task description ***
+    _, task_location, task_description, _, _ = task_info
     if task_location != Game_status:
         await interaction.followup.send("This task is not for the current game location.", ephemeral=True)
         return
 
-    # Check for an existing submission
+    # Check for an existing submission.
     cursor.execute("SELECT status, message_id FROM submissions WHERE team_id = ? AND task_id = ?", (team_id, task_id))
     existing_submission = cursor.fetchone()
 
@@ -306,27 +307,27 @@ async def submit(interaction: discord.Interaction, task_id: int):
 
         if overwrite and message_id:
             try:
-                # Fetch the old message from the moderator channel
+                # Fetch the old message from the moderator channel.
                 channel_id = config.get('moderator_channel')
                 channel = interaction.client.get_channel(channel_id)
                 if channel:
                     old_message = await channel.fetch_message(message_id)
                     if old_message:
-                        # Disable all buttons in the view
+                        # Disable all buttons in the view.
                         for component in old_message.components:
                             for item in component.children:
                                 item.disabled = True
-                        # Create a new view with updated components
+                        # Create a new view with updated components.
                         updated_view = View()
                         for component in old_message.components:
                             for item in component.children:
                                 updated_view.add_item(item)
-                        # Edit the old message to update the view
+                        # Edit the old message to update the view.
                         await old_message.edit(view=updated_view)
             except Exception as e:
                 print(f"Error fetching or editing old message: {e}")
 
-    # Insert or update the submission record
+    # Insert or update the submission record.
     cursor.execute(
         """
         INSERT INTO submissions (team_id, task_id, status, message_id, photo_url)
@@ -338,14 +339,14 @@ async def submit(interaction: discord.Interaction, task_id: int):
     )
     db.commit()
 
-    # Create first embed for Step 1 with a full-size image
+    # Create first embed for Step 1 with a full-size image.
     instruction_embed1 = discord.Embed(
         title="Step 1: Message Icon",
         description="First, click on the **message icon** as shown below."
     )
     instruction_embed1.set_image(url="attachment://road_rally_instruction_pt1.jpg")
 
-    # Create second embed for Step 2 with a full-size image
+    # Create second embed for Step 2 with a full-size image.
     instruction_embed2 = discord.Embed(
         title="Step 2: Plus Icon",
         description="Then, click on the **plus icon** and simply send your photo. The bot will handle everything else."
@@ -364,14 +365,14 @@ async def submit(interaction: discord.Interaction, task_id: int):
         return msg.author == interaction.user and len(msg.attachments) > 0
 
     try:
-        msg = await interaction.client.wait_for("message", check=check, timeout=300)  # 5-minute timeout
+        msg = await interaction.client.wait_for("message", check=check, timeout=300)  # 5-minute timeout.
     except asyncio.TimeoutError:
         await interaction.followup.send("Photo submission timed out. Please try again.", ephemeral=True)
         return
 
     photo_url = msg.attachments[0].url
 
-    # Update the photo URL in the database
+    # Update the photo URL in the database.
     cursor.execute(
         "UPDATE submissions SET photo_url = ?, status = 'Pending' WHERE team_id = ? AND task_id = ?",
         (photo_url, team_id, task_id)
@@ -379,13 +380,14 @@ async def submit(interaction: discord.Interaction, task_id: int):
     db.commit()
     await interaction.followup.send("Photo submission complete!", ephemeral=True)
 
-    # Notify the moderator channel with Accept and Deny buttons
+    # Notify the moderator channel with Accept and Deny buttons.
     channel_id = config.get('moderator_channel')
     channel = interaction.client.get_channel(channel_id)
     if channel:
+        # *** Modified: Using task_description instead of task_id in the embed ***
         embed = discord.Embed(
             title=f"Task {action_message.capitalize()}",
-            description=f"New {action_message} for task {task_id}"
+            description=f"New {action_message} for task: {task_description}"
         )
         embed.add_field(name="Team ID", value=team_id, inline=True)
         embed.add_field(name="Submitted By", value=interaction.user.mention, inline=True)
@@ -403,14 +405,12 @@ async def submit(interaction: discord.Interaction, task_id: int):
 
         review_view = View()
 
-        # Accept Button
+        # Accept Button callback.
         async def accept_callback(interaction: discord.Interaction):
             if not any(role.name == "Game Admin" for role in interaction.user.roles):
-                await interaction.response.send_message("You are not authorized to perform this action.",
-                                                        ephemeral=True)
+                await interaction.response.send_message("You are not authorized to perform this action.", ephemeral=True)
                 return
 
-            # Check if the submission is already marked as accepted
             cursor.execute("SELECT status FROM submissions WHERE team_id = ? AND task_id = ?", (team_id, task_id))
             current_status = cursor.fetchone()
             if current_status and current_status[0] == "Accepted":
@@ -420,14 +420,12 @@ async def submit(interaction: discord.Interaction, task_id: int):
                 await interaction.message.edit(view=review_view)
                 return
 
-            # Retrieve the task details including judge flag.
             task_info = await get_task_by_id(task_id)
             if not task_info:
                 await interaction.response.send_message("Task not found.", ephemeral=True)
                 return
             _id, location, description, points, judge = task_info
 
-            # If judge is enabled, prompt for a custom score.
             if judge == 1:
                 await interaction.response.send_message(f"Enter a score for this submission (max {points} points):", ephemeral=True)
                 def check_score(msg):
@@ -448,14 +446,11 @@ async def submit(interaction: discord.Interaction, task_id: int):
             else:
                 awarded_points = points
 
-            # Mark the submission as accepted and add the awarded points.
-            cursor.execute("UPDATE submissions SET status = 'Accepted' WHERE team_id = ? AND task_id = ?",
-                           (team_id, task_id))
+            cursor.execute("UPDATE submissions SET status = 'Accepted' WHERE team_id = ? AND task_id = ?", (team_id, task_id))
             cursor.execute("UPDATE teams SET points = points + ? WHERE id = ?", (awarded_points, team_id))
             db.commit()
             await interaction.response.send_message("Submission accepted and points added.", ephemeral=True)
 
-            # Send a DM to all team members informing them of the accepted submission.
             cursor.execute("SELECT discord_id FROM users WHERE team_id = ?", (team_id,))
             team_members = cursor.fetchall()
             for (discord_id,) in team_members:
@@ -467,7 +462,6 @@ async def submit(interaction: discord.Interaction, task_id: int):
                 except Exception as e:
                     print(f"Failed to send DM to user {discord_id}: {e}")
 
-            # Disable all buttons in the review view
             for child in review_view.children:
                 child.disabled = True
             await interaction.message.edit(view=review_view)
@@ -476,11 +470,10 @@ async def submit(interaction: discord.Interaction, task_id: int):
         accept_button.callback = accept_callback
         review_view.add_item(accept_button)
 
-        # Deny Button
+        # Deny Button callback.
         async def deny_callback(interaction: discord.Interaction):
             if not any(role.name == "Game Admin" for role in interaction.user.roles):
-                await interaction.response.send_message("You are not authorized to perform this action.",
-                                                        ephemeral=True)
+                await interaction.response.send_message("You are not authorized to perform this action.", ephemeral=True)
                 return
             cursor.execute("SELECT status FROM submissions WHERE team_id = ? AND task_id = ?", (team_id, task_id))
             current_status = cursor.fetchone()
@@ -497,21 +490,19 @@ async def submit(interaction: discord.Interaction, task_id: int):
                 return msg.author == interaction.user
 
             try:
-                msg = await interaction.client.wait_for("message", check=check_deny, timeout=300)  # 5-minute timeout
+                msg = await interaction.client.wait_for("message", check=check_deny, timeout=300)
             except asyncio.TimeoutError:
                 await interaction.followup.send("Timed out while waiting for denial reason.", ephemeral=True)
                 return
 
             denial_reason = msg.content
-            cursor.execute("UPDATE submissions SET status = 'Denied' WHERE team_id = ? AND task_id = ?",
-                           (team_id, task_id))
+            cursor.execute("UPDATE submissions SET status = 'Denied' WHERE team_id = ? AND task_id = ?", (team_id, task_id))
             db.commit()
 
             submitter = await interaction.client.fetch_user(user_id)
             await submitter.send(f"Submission denied for Task ID {task_id}. Reason: {denial_reason}")
             await interaction.followup.send("Submission denied.", ephemeral=True)
 
-            # Disable all buttons
             for child in review_view.children:
                 child.disabled = True
             await interaction.message.edit(view=review_view)
@@ -524,8 +515,6 @@ async def submit(interaction: discord.Interaction, task_id: int):
             if is_video:
                 await channel.send(photo_url)
             new_message = await channel.send(embed=embed, view=review_view)
-
-            # Update the new message ID in the database
             cursor.execute("UPDATE submissions SET message_id = ? WHERE team_id = ? AND task_id = ?",
                            (new_message.id, team_id, task_id))
             db.commit()
