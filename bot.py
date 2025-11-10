@@ -22,7 +22,7 @@ Game_status = 0
 leaderboard_visible = True
 
 # Load configuration file
-config_file = open("config.json")
+config_file = open("configs/config.json")
 config = json.load(config_file)
 # Database setup
 db = sqlite3.connect("game.db")
@@ -45,7 +45,7 @@ db.commit()
 
 # Google Sheets setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+credentials = ServiceAccountCredentials.from_json_keyfile_name("configs/credentials.json", scope)
 client = gspread.authorize(credentials)
 
 def load_tasks_from_sheet(sheet_name):
@@ -354,8 +354,8 @@ async def submit(interaction: discord.Interaction, task_id: int):
     instruction_embed2.set_image(url="attachment://road_rally_instruction_pt2.jpg")
 
     # Attach local files; ensure the file names and paths are correct.
-    file1 = discord.File("road_rally_instruction_pt1.jpg", filename="road_rally_instruction_pt1.jpg")
-    file2 = discord.File("road_rally_instruction_pt2.jpg", filename="road_rally_instruction_pt2.jpg")
+    file1 = discord.File("assets/road_rally_instruction_pt1.jpg", filename="assets/road_rally_instruction_pt1.jpg")
+    file2 = discord.File("assets/road_rally_instruction_pt2.jpg", filename="assets/road_rally_instruction_pt2.jpg")
 
     await interaction.followup.send(embeds=[instruction_embed1, instruction_embed2], ephemeral=True,
                                     files=[file1, file2])
