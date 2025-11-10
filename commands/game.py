@@ -1,9 +1,11 @@
+import asyncio
 import discord
 from discord import app_commands
 from discord.ui import Button, View
 from database import cursor, db
 from config import config
 from utils import reject_if_not_admin, is_admin
+from sheets import load_tasks_from_sheet
 
 
 Game_status = 0  # current active location
@@ -27,6 +29,16 @@ async def get_task_by_id(task_id):
     return cursor.fetchone()
 
 
+async def _notify_user(client: discord.Client, user_id: int, message: str) -> None:
+    """Send a DM to a user, ignoring failures."""
+    try:
+        user = client.get_user(user_id) or await client.fetch_user(user_id)
+        if user:
+            await user.send(message)
+    except Exception as exc:
+        print(f"Failed to DM user {user_id}: {exc}")
+
+
 async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     """Repost accepted photo to highlights channel."""
     channel_id = config.get("spectator_channel")
@@ -41,10 +53,11 @@ async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     team_name = team_name[0] if team_name else f"Team {team_id}"
 
     embed = discord.Embed(
-        title=f"🏁 {team_name} completed a task!",
+        title="🏁 Task Completed!",
         description=f"> {task_desc}",
         color=discord.Color.green()
     )
+    embed.add_field(name="Team", value=team_name, inline=False)
     embed.add_field(name="Points", value=str(points))
     embed.set_image(url=photo_url)
     embed.set_footer(text=f"Awarded by {interaction.user.name}")
@@ -54,13 +67,22 @@ async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
 
 # ---------- Modal ----------
 class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
-    def __init__(self, team_id: int, task_id: int, max_points: int, task_desc: str, photo_url: str):
+    def __init__(
+        self,
+        team_id: int,
+        task_id: int,
+        max_points: int,
+        task_desc: str,
+        photo_url: str,
+        submitter_id: int,
+    ):
         super().__init__()
         self.team_id = team_id
         self.task_id = task_id
         self.max_points = max_points
         self.task_desc = task_desc
         self.photo_url = photo_url
+        self.submitter_id = submitter_id
 
         self.score = discord.ui.TextInput(label=f"Score (max {max_points})", required=True)
         self.add_item(self.score)
@@ -81,11 +103,67 @@ class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
         db.commit()
 
         await interaction.response.send_message(f"✅ Task accepted ({awarded} pts).", ephemeral=True)
+        await _notify_user(
+            interaction.client,
+            self.submitter_id,
+            (
+                f"✅ Your submission for '{self.task_desc}' has been accepted for "
+                f"{awarded} point{'s' if awarded != 1 else ''}!"
+            ),
+        )
         await post_to_spectator(interaction, self.team_id, self.task_desc, self.photo_url, awarded)
 
 
 # ---------- Command Setup ----------
 def setup_game(tree: app_commands.CommandTree):
+
+    @tree.command(name="start_game", description="Start the game for a specific location")
+    @app_commands.describe(location="The location ID to start")
+    async def start_game(interaction: discord.Interaction, location: int):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        cursor.execute("SELECT 1 FROM tasks WHERE location = ?", (location,))
+        if cursor.fetchone() is None:
+            await interaction.followup.send("No tasks available for this location.", ephemeral=True)
+            return
+
+        global Game_status
+        Game_status = location
+        await interaction.followup.send(f"Game started for location {location}!", ephemeral=True)
+
+        cursor.execute("SELECT DISTINCT discord_id FROM users")
+        user_ids = cursor.fetchall()
+        instruction_message = (
+            f"Hello!\n\nThe game has started for location {location}!\n\n"
+            "Use `/my_tasks` to view your tasks.\n\n"
+            "When you're ready to submit a task, use `/submit task_id:<your task id>` and follow the prompts to upload your photo.\n\n"
+            "You can also check out the leaderboard using `/leaderboard` to see how your team is doing.\n\n"
+            "Good luck!"
+        )
+
+        for (discord_id,) in user_ids:
+            try:
+                user = await interaction.client.fetch_user(discord_id)
+                await user.send(instruction_message)
+            except Exception as exc:
+                print(f"Failed to DM user {discord_id}: {exc}")
+
+    @tree.command(name="load_tasks", description="Load tasks from a Google Sheet")
+    @app_commands.describe(sheet_name="The name of the Google Sheet to load tasks from")
+    async def load_tasks(interaction: discord.Interaction, sheet_name: str):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        success = load_tasks_from_sheet(sheet_name)
+        message = (
+            f"Tasks loaded successfully from {sheet_name}."
+            if success
+            else f"Failed to load tasks from {sheet_name}."
+        )
+        await interaction.followup.send(message, ephemeral=True)
 
     # --- My Tasks ---
     @tree.command(name="my_tasks", description="View your tasks for the current location")
@@ -133,12 +211,18 @@ def setup_game(tree: app_commands.CommandTree):
             await interaction.followup.send("That task isn't active.", ephemeral=True)
             return
 
+        submitter_id = interaction.user.id
+
+        cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
+        team_row = cursor.fetchone()
+        team_name = team_row[0] if team_row else f"Team {team_id}"
+
         await interaction.followup.send("Please upload a photo for this task.", ephemeral=True)
 
         def check(m): return m.author == interaction.user and len(m.attachments) > 0
         try:
             msg = await interaction.client.wait_for("message", check=check, timeout=300)
-        except:
+        except asyncio.TimeoutError:
             await interaction.followup.send("⏰ Timeout. Try again.", ephemeral=True)
             return
 
@@ -159,10 +243,11 @@ def setup_game(tree: app_commands.CommandTree):
 
         embed = discord.Embed(title="📸 New Submission", description=f"Task: {desc}", color=discord.Color.orange())
         embed.add_field(name="Team ID", value=str(team_id))
+        embed.add_field(name="Team", value=team_name, inline=False)
         embed.add_field(name="Submitted By", value=interaction.user.mention)
         embed.set_image(url=photo_url)
 
-        review_view = View()
+        review_view = View(timeout=None)
 
         # Accept Button
         async def accept_callback(btn_inter: discord.Interaction):
@@ -172,13 +257,21 @@ def setup_game(tree: app_commands.CommandTree):
 
             if judge == 1:
                 await btn_inter.response.send_modal(
-                    ScoreModal(team_id, task_id, pts, desc, photo_url)
+                    ScoreModal(team_id, task_id, pts, desc, photo_url, submitter_id)
                 )
             else:
                 cursor.execute("UPDATE submissions SET status='Accepted' WHERE team_id=? AND task_id=?", (team_id, task_id))
                 cursor.execute("UPDATE teams SET points=points+? WHERE id=?", (pts, team_id))
                 db.commit()
                 await btn_inter.response.send_message("✅ Task accepted.", ephemeral=True)
+                await _notify_user(
+                    btn_inter.client,
+                    submitter_id,
+                    (
+                        f"✅ Your submission for '{desc}' has been accepted for "
+                        f"{pts} point{'s' if pts != 1 else ''}!"
+                    ),
+                )
                 await post_to_spectator(btn_inter, team_id, desc, photo_url, pts)
 
         accept_button = Button(label="Accept", style=discord.ButtonStyle.success)
@@ -194,12 +287,15 @@ def setup_game(tree: app_commands.CommandTree):
             class DenyModal(discord.ui.Modal, title="Reason for Denial"):
                 reason = discord.ui.TextInput(label="Reason", required=True)
 
-                async def on_submit(self, inter):
+                async def on_submit(self, modal_inter: discord.Interaction):
                     cursor.execute("UPDATE submissions SET status='Denied' WHERE team_id=? AND task_id=?", (team_id, task_id))
                     db.commit()
-                    await inter.response.send_message("Submission denied.", ephemeral=True)
-                    # DM the submitter
-                    await interaction.user.send(f"❌ Your submission for '{desc}' was denied. Reason: {self.reason.value}")
+                    await modal_inter.response.send_message("Submission denied.", ephemeral=True)
+                    await _notify_user(
+                        modal_inter.client,
+                        submitter_id,
+                        f"❌ Your submission for '{desc}' was denied. Reason: {self.reason.value}",
+                    )
 
             await btn_inter.response.send_modal(DenyModal())
 
