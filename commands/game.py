@@ -4,6 +4,7 @@ from discord.ui import Button, View
 from database import cursor, db
 from config import config
 from utils import reject_if_not_admin, is_admin
+from sheets import load_tasks_from_sheet
 
 
 Game_status = 0  # current active location
@@ -86,6 +87,54 @@ class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
 
 # ---------- Command Setup ----------
 def setup_game(tree: app_commands.CommandTree):
+
+    @tree.command(name="start_game", description="Start the game for a specific location")
+    @app_commands.describe(location="The location ID to start")
+    async def start_game(interaction: discord.Interaction, location: int):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        cursor.execute("SELECT 1 FROM tasks WHERE location = ?", (location,))
+        if cursor.fetchone() is None:
+            await interaction.followup.send("No tasks available for this location.", ephemeral=True)
+            return
+
+        global Game_status
+        Game_status = location
+        await interaction.followup.send(f"Game started for location {location}!", ephemeral=True)
+
+        cursor.execute("SELECT DISTINCT discord_id FROM users")
+        user_ids = cursor.fetchall()
+        instruction_message = (
+            f"Hello!\n\nThe game has started for location {location}!\n\n"
+            "Use `/my_tasks` to view your tasks.\n\n"
+            "When you're ready to submit a task, use `/submit task_id:<your task id>` and follow the prompts to upload your photo.\n\n"
+            "You can also check out the leaderboard using `/leaderboard` to see how your team is doing.\n\n"
+            "Good luck!"
+        )
+
+        for (discord_id,) in user_ids:
+            try:
+                user = await interaction.client.fetch_user(discord_id)
+                await user.send(instruction_message)
+            except Exception as exc:
+                print(f"Failed to DM user {discord_id}: {exc}")
+
+    @tree.command(name="load_tasks", description="Load tasks from a Google Sheet")
+    @app_commands.describe(sheet_name="The name of the Google Sheet to load tasks from")
+    async def load_tasks(interaction: discord.Interaction, sheet_name: str):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        success = load_tasks_from_sheet(sheet_name)
+        message = (
+            f"Tasks loaded successfully from {sheet_name}."
+            if success
+            else f"Failed to load tasks from {sheet_name}."
+        )
+        await interaction.followup.send(message, ephemeral=True)
 
     # --- My Tasks ---
     @tree.command(name="my_tasks", description="View your tasks for the current location")

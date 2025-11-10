@@ -4,6 +4,7 @@ from config import BOT_TOKEN
 from commands.game import setup_game
 from commands.leaderboard import setup_leaderboard
 from commands.points import setup_points
+from commands.teams import setup_teams
 
 intents = discord.Intents.default()
 intents.messages = True
