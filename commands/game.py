@@ -39,6 +39,24 @@ async def _notify_user(client: discord.Client, user_id: int, message: str) -> No
         print(f"Failed to DM user {user_id}: {exc}")
 
 
+async def disable_view_buttons(view: View, message: discord.Message) -> None:
+    """Disable every button in a view and refresh the originating message."""
+    for child in view.children:
+        child.disabled = True
+    await message.edit(view=view)
+
+
+async def disable_message_components(message: discord.Message) -> None:
+    """Disable the interactive components that were attached to a stored message."""
+    try:
+        view = View.from_message(message)
+    except Exception as exc:
+        print(f"Unable to reconstruct view for message {message.id}: {exc}")
+        return
+
+    await disable_view_buttons(view, message)
+
+
 async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     """Repost accepted photo to highlights channel."""
     channel_id = config.get("spectator_channel")
@@ -65,6 +83,20 @@ async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     await channel.send(embed=embed)
 
 
+async def disable_previous_review_message(channel: discord.abc.MessageableChannel, message_id: int | None) -> None:
+    """Fetch a stored moderator message and disable its buttons if it exists."""
+    if not message_id:
+        return
+
+    try:
+        old_message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+        print(f"Unable to fetch previous review message {message_id}: {exc}")
+        return
+
+    await disable_message_components(old_message)
+
+
 # ---------- Modal ----------
 class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
     def __init__(
@@ -75,6 +107,8 @@ class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
         task_desc: str,
         photo_url: str,
         submitter_id: int,
+        review_view: View,
+        review_message: discord.Message,
     ):
         super().__init__()
         self.team_id = team_id
@@ -83,6 +117,8 @@ class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
         self.task_desc = task_desc
         self.photo_url = photo_url
         self.submitter_id = submitter_id
+        self.review_view = review_view
+        self.review_message = review_message
 
         self.score = discord.ui.TextInput(label=f"Score (max {max_points})", required=True)
         self.add_item(self.score)
@@ -112,6 +148,8 @@ class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
             ),
         )
         await post_to_spectator(interaction, self.team_id, self.task_desc, self.photo_url, awarded)
+
+        await disable_view_buttons(self.review_view, self.review_message)
 
 
 # ---------- Command Setup ----------
@@ -211,13 +249,41 @@ def setup_game(tree: app_commands.CommandTree):
             await interaction.followup.send("That task isn't active.", ephemeral=True)
             return
 
+        cursor.execute(
+            "SELECT status, message_id FROM submissions WHERE team_id=? AND task_id=?",
+            (team_id, task_id),
+        )
+        existing_submission = cursor.fetchone()
+        is_reupload = False
+        previous_message_id = None
+        if existing_submission:
+            status, previous_message_id = existing_submission
+            if status == "Accepted":
+                await interaction.followup.send("✅ This task has already been accepted for your team.", ephemeral=True)
+                return
+            if status == "Pending":
+                is_reupload = True
+
         submitter_id = interaction.user.id
 
         cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
         team_row = cursor.fetchone()
         team_name = team_row[0] if team_row else f"Team {team_id}"
 
-        await interaction.followup.send("Please upload a photo for this task.", ephemeral=True)
+        mod_channel_id = config.get("moderator_channel")
+        channel = interaction.client.get_channel(mod_channel_id) if mod_channel_id else None
+        if not channel:
+            await interaction.followup.send("Moderator channel not found.", ephemeral=True)
+            return
+
+        prompt = "Please upload a photo for this task."
+        if is_reupload:
+            prompt = (
+                "⏳ You already have a pending submission. Uploading a new photo will replace it "
+                "and disable the old review buttons."
+            )
+
+        await interaction.followup.send(prompt, ephemeral=True)
 
         def check(m): return m.author == interaction.user and len(m.attachments) > 0
         try:
@@ -227,19 +293,9 @@ def setup_game(tree: app_commands.CommandTree):
             return
 
         photo_url = msg.attachments[0].url
-        cursor.execute("""
-            INSERT INTO submissions(team_id, task_id, status, photo_url)
-            VALUES (?, ?, 'Pending', ?)
-            ON CONFLICT(team_id, task_id) DO UPDATE SET status='Pending', photo_url=excluded.photo_url
-        """, (team_id, task_id, photo_url))
-        db.commit()
 
-        # notify mod channel
-        mod_channel_id = config.get("moderator_channel")
-        channel = interaction.client.get_channel(mod_channel_id)
-        if not channel:
-            await interaction.followup.send("Moderator channel not found.", ephemeral=True)
-            return
+        if is_reupload and previous_message_id:
+            await disable_previous_review_message(channel, previous_message_id)
 
         embed = discord.Embed(title="📸 New Submission", description=f"Task: {desc}", color=discord.Color.orange())
         embed.add_field(name="Team ID", value=str(team_id))
@@ -255,9 +311,23 @@ def setup_game(tree: app_commands.CommandTree):
                 await btn_inter.response.send_message("Not authorized.", ephemeral=True)
                 return
 
+            review_message = btn_inter.message
+            if review_message is None:
+                await btn_inter.response.send_message("Unable to locate the review message.", ephemeral=True)
+                return
+
             if judge == 1:
                 await btn_inter.response.send_modal(
-                    ScoreModal(team_id, task_id, pts, desc, photo_url, submitter_id)
+                    ScoreModal(
+                        team_id,
+                        task_id,
+                        pts,
+                        desc,
+                        photo_url,
+                        submitter_id,
+                        review_view,
+                        review_message,
+                    )
                 )
             else:
                 cursor.execute("UPDATE submissions SET status='Accepted' WHERE team_id=? AND task_id=?", (team_id, task_id))
@@ -273,6 +343,7 @@ def setup_game(tree: app_commands.CommandTree):
                     ),
                 )
                 await post_to_spectator(btn_inter, team_id, desc, photo_url, pts)
+                await disable_view_buttons(review_view, review_message)
 
         accept_button = Button(label="Accept", style=discord.ButtonStyle.success)
         accept_button.callback = accept_callback
@@ -284,8 +355,16 @@ def setup_game(tree: app_commands.CommandTree):
                 await btn_inter.response.send_message("Not authorized.", ephemeral=True)
                 return
 
+            review_message = btn_inter.message
+            if review_message is None:
+                await btn_inter.response.send_message("Unable to locate the review message.", ephemeral=True)
+                return
+
             class DenyModal(discord.ui.Modal, title="Reason for Denial"):
-                reason = discord.ui.TextInput(label="Reason", required=True)
+                def __init__(self):
+                    super().__init__()
+                    self.reason = discord.ui.TextInput(label="Reason", required=True)
+                    self.add_item(self.reason)
 
                 async def on_submit(self, modal_inter: discord.Interaction):
                     cursor.execute("UPDATE submissions SET status='Denied' WHERE team_id=? AND task_id=?", (team_id, task_id))
@@ -296,6 +375,7 @@ def setup_game(tree: app_commands.CommandTree):
                         submitter_id,
                         f"❌ Your submission for '{desc}' was denied. Reason: {self.reason.value}",
                     )
+                    await disable_view_buttons(review_view, review_message)
 
             await btn_inter.response.send_modal(DenyModal())
 
@@ -303,5 +383,17 @@ def setup_game(tree: app_commands.CommandTree):
         deny_button.callback = deny_callback
         review_view.add_item(deny_button)
 
-        await channel.send(embed=embed, view=review_view)
+        review_message = await channel.send(embed=embed, view=review_view)
+
+        cursor.execute(
+            """
+            INSERT INTO submissions(team_id, task_id, status, photo_url, message_id)
+            VALUES (?, ?, 'Pending', ?, ?)
+            ON CONFLICT(team_id, task_id)
+            DO UPDATE SET status='Pending', photo_url=excluded.photo_url, message_id=excluded.message_id
+            """,
+            (team_id, task_id, photo_url, review_message.id),
+        )
+        db.commit()
+
         await interaction.followup.send("📩 Submission sent for review!", ephemeral=True)
