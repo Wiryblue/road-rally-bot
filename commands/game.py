@@ -310,6 +310,22 @@ def setup_game(tree: app_commands.CommandTree):
 
         photo_url = msg.attachments[0].url
 
+        if is_reupload:
+            # The previous submission might have been accepted while the player was
+            # uploading a replacement. Re-check the database before overriding the
+            # status so we don't resurrect an already approved task.
+            cursor.execute(
+                "SELECT status, message_id FROM submissions WHERE team_id=? AND task_id=?",
+                (team_id, task_id),
+            )
+            refreshed_submission = cursor.fetchone()
+            if refreshed_submission and refreshed_submission[0] == "Accepted":
+                await interaction.followup.send(
+                    "✅ Your last upload was already accepted, so there's no need to re-submit.",
+                    ephemeral=True,
+                )
+                return
+
         if is_reupload and previous_message_id:
             await disable_previous_review_message(channel, previous_message_id)
 
