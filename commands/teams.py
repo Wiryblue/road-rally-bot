@@ -1,211 +1,125 @@
 import discord
 from discord import app_commands
-from discord.ui import Button, View
-from database import cursor, db
-from config import config
-from utils import reject_if_not_admin, is_admin
+from typing import Optional, List
+
+from database import cursor, db, add_user_to_team
+from utils import reject_if_not_admin
 
 
-Game_status = 0  # current active location
+async def _gather_member_names(interaction: discord.Interaction, team_id: int) -> List[str]:
+    cursor.execute("SELECT discord_id FROM users WHERE team_id = ?", (team_id,))
+    members = []
+    for (discord_id,) in cursor.fetchall():
+        user = interaction.client.get_user(discord_id)
+        if user is None:
+            try:
+                user = await interaction.client.fetch_user(discord_id)
+            except Exception:
+                user = None
+        members.append(user.name if user else f"Unknown({discord_id})")
+    return members
 
 
-# ---------- Helper ----------
-def get_tasks_with_status(team_id, location):
-    cursor.execute("""
-        SELECT t.id, t.description, t.points,
-               COALESCE(s.status, 'Not Submitted') AS status
-        FROM tasks t
-        LEFT JOIN submissions s
-               ON t.id = s.task_id AND s.team_id = ?
-        WHERE t.location = ?
-    """, (team_id, location))
-    return cursor.fetchall()
+def setup_teams(tree: app_commands.CommandTree):
 
-
-async def get_task_by_id(task_id):
-    cursor.execute("SELECT id, location, description, points, judge FROM tasks WHERE id = ?", (task_id,))
-    return cursor.fetchone()
-
-
-async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
-    """Repost accepted photo to highlights channel."""
-    channel_id = config.get("spectator_channel")
-    if not channel_id:
-        return
-    channel = interaction.client.get_channel(channel_id)
-    if not channel:
-        return
-
-    cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
-    team_name = cursor.fetchone()
-    team_name = team_name[0] if team_name else f"Team {team_id}"
-
-    embed = discord.Embed(
-        title=f"🏁 {team_name} completed a task!",
-        description=f"> {task_desc}",
-        color=discord.Color.green()
+    @tree.command(name="create_team", description="Create a new team")
+    @app_commands.describe(
+        team_name="The name of the team",
+        user1="Team member",
+        user2="Team member",
+        user3="Team member",
+        user4="Team member",
+        user5="Team member",
+        user6="Team member",
     )
-    embed.add_field(name="Points", value=str(points))
-    embed.set_image(url=photo_url)
-    embed.set_footer(text=f"Awarded by {interaction.user.name}")
-
-    await channel.send(embed=embed)
-
-
-# ---------- Modal ----------
-class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
-    def __init__(self, team_id: int, task_id: int, max_points: int, task_desc: str, photo_url: str):
-        super().__init__()
-        self.team_id = team_id
-        self.task_id = task_id
-        self.max_points = max_points
-        self.task_desc = task_desc
-        self.photo_url = photo_url
-
-        self.score = discord.ui.TextInput(label=f"Score (max {max_points})", required=True)
-        self.add_item(self.score)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            awarded = int(self.score.value)
-        except ValueError:
-            await interaction.response.send_message("Invalid score.", ephemeral=True)
+    async def create_team(
+        interaction: discord.Interaction,
+        team_name: str,
+        user1: discord.Member,
+        user2: Optional[discord.Member] = None,
+        user3: Optional[discord.Member] = None,
+        user4: Optional[discord.Member] = None,
+        user5: Optional[discord.Member] = None,
+        user6: Optional[discord.Member] = None,
+    ):
+        if await reject_if_not_admin(interaction):
             return
-
-        if awarded > self.max_points:
-            await interaction.response.send_message(f"Score cannot exceed {self.max_points}.", ephemeral=True)
-            return
-
-        cursor.execute("UPDATE submissions SET status='Accepted' WHERE team_id=? AND task_id=?", (self.team_id, self.task_id))
-        cursor.execute("UPDATE teams SET points=points+? WHERE id=?", (awarded, self.team_id))
-        db.commit()
-
-        await interaction.response.send_message(f"✅ Task accepted ({awarded} pts).", ephemeral=True)
-        await post_to_spectator(interaction, self.team_id, self.task_desc, self.photo_url, awarded)
-
-
-# ---------- Command Setup ----------
-def setup_game(tree: app_commands.CommandTree):
-
-    # --- My Tasks ---
-    @tree.command(name="my_tasks", description="View your tasks for the current location")
-    async def my_tasks(interaction: discord.Interaction):
-        user_id = interaction.user.id
-        cursor.execute("SELECT team_id FROM users WHERE discord_id = ?", (user_id,))
-        result = cursor.fetchone()
-        if not result:
-            await interaction.response.send_message("You're not on a team.", ephemeral=True)
-            return
-
-        team_id = result[0]
-        tasks = get_tasks_with_status(team_id, Game_status)
-        if not tasks:
-            await interaction.response.send_message("No tasks for your location.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title="📋 Tasks", color=discord.Color.blurple())
-        for tid, desc, pts, status in tasks:
-            icon = "✅" if status == "Accepted" else "🟡" if status == "Pending" else "❌"
-            embed.add_field(name=f"{icon} Task {tid}", value=f"{desc} ({pts} pts) - {status}", inline=False)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    # --- Submit Photo ---
-    @tree.command(name="submit", description="Submit a photo for a task ID")
-    @app_commands.describe(task_id="Task ID")
-    async def submit(interaction: discord.Interaction, task_id: int):
         await interaction.response.defer(ephemeral=True)
 
-        # identify team
-        cursor.execute("SELECT team_id FROM users WHERE discord_id=?", (interaction.user.id,))
-        r = cursor.fetchone()
-        if not r:
-            await interaction.followup.send("You're not registered.", ephemeral=True)
-            return
-        team_id = r[0]
+        users = [user for user in (user1, user2, user3, user4, user5, user6) if user is not None]
+        cursor.execute("INSERT INTO teams (name, points) VALUES (?, 0)", (team_name,))
+        team_id = cursor.lastrowid
 
-        task_info = await get_task_by_id(task_id)
-        if not task_info:
-            await interaction.followup.send("Task not found.", ephemeral=True)
-            return
-        _, loc, desc, pts, judge = task_info
-        if loc != Game_status:
-            await interaction.followup.send("That task isn't active.", ephemeral=True)
-            return
+        duplicate_users = []
+        added_users = []
+        for user in users:
+            cursor.execute("SELECT team_id FROM users WHERE discord_id = ?", (user.id,))
+            if cursor.fetchone():
+                duplicate_users.append(user.display_name)
+                continue
+            add_user_to_team(user.id, team_id)
+            added_users.append(user.display_name)
 
-        await interaction.followup.send("Please upload a photo for this task.", ephemeral=True)
-
-        def check(m): return m.author == interaction.user and len(m.attachments) > 0
-        try:
-            msg = await interaction.client.wait_for("message", check=check, timeout=300)
-        except:
-            await interaction.followup.send("⏰ Timeout. Try again.", ephemeral=True)
-            return
-
-        photo_url = msg.attachments[0].url
-        cursor.execute("""
-            INSERT INTO submissions(team_id, task_id, status, photo_url)
-            VALUES (?, ?, 'Pending', ?)
-            ON CONFLICT(team_id, task_id) DO UPDATE SET status='Pending', photo_url=excluded.photo_url
-        """, (team_id, task_id, photo_url))
         db.commit()
 
-        # notify mod channel
-        mod_channel_id = config.get("moderator_channel")
-        channel = interaction.client.get_channel(mod_channel_id)
-        if not channel:
-            await interaction.followup.send("Moderator channel not found.", ephemeral=True)
+        response = [f"Team '{team_name}' created successfully! (ID: {team_id})"]
+        response.append("Added members: " + (", ".join(added_users) if added_users else "None"))
+        if duplicate_users:
+            response.append("Skipped (already on a team): " + ", ".join(duplicate_users))
+
+        await interaction.followup.send("\n".join(response), ephemeral=True)
+
+    @tree.command(name="list_teams", description="Private list of teams and their members")
+    async def list_teams(interaction: discord.Interaction):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        cursor.execute("SELECT id, name, points FROM teams")
+        teams = cursor.fetchall()
+        if not teams:
+            await interaction.followup.send("No teams registered yet.", ephemeral=True)
             return
 
-        embed = discord.Embed(title="📸 New Submission", description=f"Task: {desc}", color=discord.Color.orange())
-        embed.add_field(name="Team ID", value=str(team_id))
-        embed.add_field(name="Submitted By", value=interaction.user.mention)
-        embed.set_image(url=photo_url)
+        lines = []
+        for team_id, team_name, points in teams:
+            members = await _gather_member_names(interaction, team_id)
+            member_str = ", ".join(members) if members else "No members"
+            lines.append(f"**Team {team_name} (ID: {team_id}, Points: {points})**\nMembers: {member_str}\n")
 
-        review_view = View()
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-        # Accept Button
-        async def accept_callback(btn_inter: discord.Interaction):
-            if not is_admin(btn_inter.user):
-                await btn_inter.response.send_message("Not authorized.", ephemeral=True)
-                return
+    @tree.command(name="rename_team", description="Rename an existing team (Game Admin only)")
+    @app_commands.describe(team_id="The ID of the team to rename", new_name="The new name for the team")
+    async def rename_team(interaction: discord.Interaction, team_id: int, new_name: str):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
 
-            if judge == 1:
-                await btn_inter.response.send_modal(
-                    ScoreModal(team_id, task_id, pts, desc, photo_url)
-                )
-            else:
-                cursor.execute("UPDATE submissions SET status='Accepted' WHERE team_id=? AND task_id=?", (team_id, task_id))
-                cursor.execute("UPDATE teams SET points=points+? WHERE id=?", (pts, team_id))
-                db.commit()
-                await btn_inter.response.send_message("✅ Task accepted.", ephemeral=True)
-                await post_to_spectator(btn_inter, team_id, desc, photo_url, pts)
+        cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
+        if cursor.fetchone() is None:
+            await interaction.followup.send(f"Team with ID {team_id} not found.", ephemeral=True)
+            return
 
-        accept_button = Button(label="Accept", style=discord.ButtonStyle.success)
-        accept_button.callback = accept_callback
-        review_view.add_item(accept_button)
+        cursor.execute("UPDATE teams SET name = ? WHERE id = ?", (new_name, team_id))
+        db.commit()
+        await interaction.followup.send(f"Team renamed successfully to '{new_name}'.", ephemeral=True)
 
-        # Deny Button
-        async def deny_callback(btn_inter: discord.Interaction):
-            if not is_admin(btn_inter.user):
-                await btn_inter.response.send_message("Not authorized.", ephemeral=True)
-                return
+    @tree.command(name="remove_team", description="Remove an existing team (Game Admin only)")
+    @app_commands.describe(team_id="The ID of the team to remove")
+    async def remove_team(interaction: discord.Interaction, team_id: int):
+        if await reject_if_not_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
 
-            class DenyModal(discord.ui.Modal, title="Reason for Denial"):
-                reason = discord.ui.TextInput(label="Reason", required=True)
+        cursor.execute("SELECT name FROM teams WHERE id = ?", (team_id,))
+        team = cursor.fetchone()
+        if team is None:
+            await interaction.followup.send(f"Team with ID {team_id} not found.", ephemeral=True)
+            return
 
-                async def on_submit(self, inter):
-                    cursor.execute("UPDATE submissions SET status='Denied' WHERE team_id=? AND task_id=?", (team_id, task_id))
-                    db.commit()
-                    await inter.response.send_message("Submission denied.", ephemeral=True)
-                    # DM the submitter
-                    await interaction.user.send(f"❌ Your submission for '{desc}' was denied. Reason: {self.reason.value}")
+        cursor.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+        cursor.execute("DELETE FROM users WHERE team_id = ?", (team_id,))
+        db.commit()
+        await interaction.followup.send(f"Team '{team[0]}' and its members have been removed.", ephemeral=True)
 
-            await btn_inter.response.send_modal(DenyModal())
-
-        deny_button = Button(label="Deny", style=discord.ButtonStyle.danger)
-        deny_button.callback = deny_callback
-        review_view.add_item(deny_button)
-
-        await channel.send(embed=embed, view=review_view)
-        await interaction.followup.send("📩 Submission sent for review!", ephemeral=True)
