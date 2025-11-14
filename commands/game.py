@@ -57,6 +57,15 @@ async def disable_message_components(message: discord.Message) -> None:
     await disable_view_buttons(view, message)
 
 
+def submission_was_already_accepted(team_id: int, task_id: int) -> bool:
+    cursor.execute(
+        "SELECT status FROM submissions WHERE team_id=? AND task_id=?",
+        (team_id, task_id),
+    )
+    row = cursor.fetchone()
+    return bool(row and row[0] == "Accepted")
+
+
 async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     """Repost accepted photo to highlights channel."""
     channel_id = config.get("spectator_channel")
@@ -132,6 +141,13 @@ class ScoreModal(discord.ui.Modal, title="Enter Task Score"):
 
         if awarded > self.max_points:
             await interaction.response.send_message(f"Score cannot exceed {self.max_points}.", ephemeral=True)
+            return
+
+        if submission_was_already_accepted(self.team_id, self.task_id):
+            await interaction.response.send_message(
+                "This submission was already accepted.", ephemeral=True
+            )
+            await disable_view_buttons(self.review_view, self.review_message)
             return
 
         cursor.execute("UPDATE submissions SET status='Accepted' WHERE team_id=? AND task_id=?", (self.team_id, self.task_id))
@@ -330,6 +346,12 @@ def setup_game(tree: app_commands.CommandTree):
                     )
                 )
             else:
+                if submission_was_already_accepted(team_id, task_id):
+                    await btn_inter.response.send_message(
+                        "This submission was already accepted.", ephemeral=True
+                    )
+                    await disable_view_buttons(review_view, review_message)
+                    return
                 cursor.execute("UPDATE submissions SET status='Accepted' WHERE team_id=? AND task_id=?", (team_id, task_id))
                 cursor.execute("UPDATE teams SET points=points+? WHERE id=?", (pts, team_id))
                 db.commit()
