@@ -19,7 +19,7 @@ def get_tasks_with_status(team_id, location):
         FROM tasks t
         LEFT JOIN submissions s
                ON t.id = s.task_id AND s.team_id = ?
-        WHERE t.location = ?
+        WHERE (t.location = ? OR t.location = 0)
     """, (team_id, location))
     return cursor.fetchall()
 
@@ -78,7 +78,7 @@ async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     embed.add_field(name="Team", value=team_name, inline=False)
     embed.add_field(name="Points", value=str(points))
     embed.set_image(url=photo_url)
-    embed.set_footer(text=f"Awarded by {interaction.user.name}")
+    embed.set_footer(text=f"Awarded by {interaction.user.display_name}")
 
     await channel.send(embed=embed)
 
@@ -245,7 +245,7 @@ def setup_game(tree: app_commands.CommandTree):
             await interaction.followup.send("Task not found.", ephemeral=True)
             return
         _, loc, desc, pts, judge = task_info
-        if loc != Game_status:
+        if loc != Game_status and loc >= 1:
             await interaction.followup.send("That task isn't active.", ephemeral=True)
             return
 
