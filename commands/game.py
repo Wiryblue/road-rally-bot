@@ -83,7 +83,7 @@ async def post_to_spectator(interaction, team_id, task_desc, photo_url, points):
     await channel.send(embed=embed)
 
 
-async def disable_previous_review_message(channel: discord.abc.MessageableChannel, message_id: int | None) -> None:
+async def disable_previous_review_message(channel: discord.abc.Messageable, message_id: int | None) -> None:
     """Fetch a stored moderator message and disable its buttons if it exists."""
     if not message_id:
         return
@@ -162,7 +162,7 @@ def setup_game(tree: app_commands.CommandTree):
             return
         await interaction.response.defer(ephemeral=True)
 
-        cursor.execute("SELECT 1 FROM tasks WHERE (location = ? OR location = 0)", (location,))
+        cursor.execute("SELECT 1 FROM tasks WHERE location = ?", (location,))
         if cursor.fetchone() is None:
             await interaction.followup.send("No tasks available for this location.", ephemeral=True)
             return
