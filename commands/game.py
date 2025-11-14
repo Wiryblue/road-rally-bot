@@ -207,7 +207,7 @@ def setup_game(tree: app_commands.CommandTree):
             await interaction.followup.send("Task not found.", ephemeral=True)
             return
         _, loc, desc, pts, judge = task_info
-        if loc != Game_status:
+        if loc != Game_status and loc >= 1:
             await interaction.followup.send("That task isn't active.", ephemeral=True)
             return
 
