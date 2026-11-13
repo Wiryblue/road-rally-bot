@@ -1,0 +1,4 @@
+# Install with: pip install -U -r requirements.txt
+discord.py>=2.5,<3  # 2.5+ needed: the bot forwards players' videos to the judges
+gspread>=6,<7       # /load_tasks reads tasks from Google Sheets
+google-auth>=2
