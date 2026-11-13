@@ -1,0 +1,6 @@
+{
+  "bot_token": "set DISCORD_BOT_TOKEN instead of filling this in",
+  "moderator_channel": 0,
+  "spectator_channel": 0,
+  "server_id": 0
+}
