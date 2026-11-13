@@ -3,6 +3,10 @@ import sqlite3
 db = sqlite3.connect("game.db")
 cursor = db.cursor()
 
+# WAL + NORMAL sync keeps commits fast on a Pi's SD card while staying crash-safe.
+cursor.execute("PRAGMA journal_mode=WAL")
+cursor.execute("PRAGMA synchronous=NORMAL")
+
 cursor.executescript("""
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -49,6 +53,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_location ON tasks(location);
 _submission_columns = {row[1] for row in cursor.execute("PRAGMA table_info(submissions)")}
 if "submitter_id" not in _submission_columns:
     cursor.execute("ALTER TABLE submissions ADD COLUMN submitter_id INTEGER")
+# Where the player's original upload lives, so the bot can forward it instead of re-uploading.
+for _column in ("source_channel_id", "source_message_id"):
+    if _column not in _submission_columns:
+        cursor.execute(f"ALTER TABLE submissions ADD COLUMN {_column} INTEGER")
 db.commit()
 
 # --- Helpers ---

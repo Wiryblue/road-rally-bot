@@ -3,7 +3,7 @@ import asyncio
 import discord
 
 # Keep bulk DMs from tripping Discord's rate limits.
-_DM_CONCURRENCY = 5
+DM_CONCURRENCY = 5
 
 
 def is_admin(user):
@@ -16,24 +16,24 @@ async def reject_if_not_admin(interaction):
     return False
 
 
-async def dm_user(client: discord.Client, user_id: int, message: str) -> bool:
+async def dm_user(client: discord.Client, user_id: int, content: str | None = None, **kwargs) -> bool:
     """Send a DM, preferring the local cache over an API lookup. Returns False on failure."""
     try:
         user = client.get_user(user_id) or await client.fetch_user(user_id)
-        await user.send(message)
+        await user.send(content, **kwargs)
         return True
     except discord.HTTPException as exc:
         print(f"Failed to DM user {user_id}: {exc}")
         return False
 
 
-async def dm_many(client: discord.Client, user_ids, message: str) -> int:
+async def dm_many(client: discord.Client, user_ids, content: str | None = None, **kwargs) -> int:
     """DM several users concurrently. Returns how many DMs were delivered."""
-    semaphore = asyncio.Semaphore(_DM_CONCURRENCY)
+    semaphore = asyncio.Semaphore(DM_CONCURRENCY)
 
     async def send(user_id):
         async with semaphore:
-            return await dm_user(client, user_id, message)
+            return await dm_user(client, user_id, content, **kwargs)
 
     results = await asyncio.gather(*(send(uid) for uid in set(user_ids)))
     return sum(results)
@@ -50,3 +50,8 @@ def chunk_lines(lines, limit=1900):
     if current:
         chunks.append(current)
     return chunks
+
+
+def progress_bar(value, total, width=10):
+    filled = round(width * value / total) if total else 0
+    return "▰" * filled + "▱" * (width - filled)
