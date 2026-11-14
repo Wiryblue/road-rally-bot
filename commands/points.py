@@ -1,8 +1,11 @@
+import logging
 import discord
 from discord import app_commands
 from database import cursor, db, get_team_member_ids
 from commands.leaderboard import request_leaderboard_refresh
 from utils import reject_if_not_admin, dm_many
+
+log = logging.getLogger("rally.points")
 
 
 async def _adjust_points(interaction: discord.Interaction, team_id: int, delta: int, reason: str | None):
@@ -12,6 +15,7 @@ async def _adjust_points(interaction: discord.Interaction, team_id: int, delta: 
         await interaction.response.send_message(f"Team {team_id} not found. Check `/list_teams`.", ephemeral=True)
         return
 
+    log.info("POINTS %+d for team %s by %s (%s)", delta, team_id, interaction.user, reason or "no reason")
     verb = f"Added {delta} points to" if delta >= 0 else f"Removed {-delta} points from"
     suffix = f" Reason: {reason}" if reason else ""
     await interaction.response.send_message(f"{verb} team {team_id}.{suffix}", ephemeral=True)

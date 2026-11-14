@@ -1,3 +1,4 @@
+import logging
 import asyncio
 import time
 
@@ -6,6 +7,8 @@ from discord import app_commands
 from config import config
 from database import fetch_leaderboard, get_setting, set_setting
 from utils import reject_if_not_admin, is_admin, chunk_lines, progress_bar
+
+log = logging.getLogger("rally.leaderboard")
 
 # Point changes arriving within this window are folded into a single message edit.
 LIVE_REFRESH_DELAY = 5
@@ -62,14 +65,14 @@ async def _refresh_live_leaderboard(client: discord.Client) -> None:
     except discord.NotFound:
         pass  # someone deleted it; post a fresh one below
     except discord.HTTPException as exc:
-        print(f"Failed to update live leaderboard: {exc}")
+        log.warning("Failed to update live leaderboard: %s", exc)
         return
 
     try:
         message = await channel.send(embed=embed)
         set_setting("live_leaderboard_message", message.id)
     except discord.HTTPException as exc:
-        print(f"Failed to post live leaderboard: {exc}")
+        log.warning("Failed to post live leaderboard: %s", exc)
 
 
 def setup_leaderboard(tree: app_commands.CommandTree):

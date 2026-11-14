@@ -166,3 +166,6 @@ configs/credentials.json
 game.db
 .DS_Store
 configs/config.json
+
+# Bot logs
+logs/

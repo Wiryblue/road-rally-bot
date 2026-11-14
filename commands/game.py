@@ -1,3 +1,4 @@
+import logging
 import asyncio
 import os
 import re
@@ -20,6 +21,8 @@ from config import config
 from utils import reject_if_not_admin, is_admin, dm_many, chunk_lines, progress_bar
 from commands.leaderboard import request_leaderboard_refresh
 from sheets import load_tasks_from_sheet
+
+log = logging.getLogger("rally.game")
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv", ".3gp"}
@@ -123,7 +126,7 @@ async def forward_media(client: discord.Client, channel: discord.abc.Messageable
         return True
     except discord.HTTPException as exc:
         # The player deleted the message, or Discord refused the forward; fall back to the link.
-        print(f"Forwarding message {media.message_id} failed: {exc}")
+        log.warning("Forwarding message %s failed, posting link instead: %s", media.message_id, exc)
         return False
 
 
@@ -160,7 +163,7 @@ async def close_review_message(message: discord.Message, note: str, color: disco
     try:
         await message.edit(embed=embed, view=None)
     except discord.HTTPException as exc:
-        print(f"Unable to update review message {message.id}: {exc}")
+        log.warning("Unable to update review message %s: %s", message.id, exc)
 
 
 async def close_previous_review_message(channel, message_id: Optional[int]) -> None:
@@ -169,7 +172,7 @@ async def close_previous_review_message(channel, message_id: Optional[int]) -> N
     try:
         old_message = await channel.fetch_message(message_id)
     except discord.HTTPException as exc:
-        print(f"Unable to fetch previous review message {message_id}: {exc}")
+        log.warning("Unable to fetch previous review message %s: %s", message_id, exc)
         return
     await close_review_message(old_message, "Superseded by a newer upload", discord.Color.dark_grey())
 
@@ -200,7 +203,7 @@ async def post_to_spectator(client: discord.Client, review_message: discord.Mess
     try:
         await send_with_media(client, channel, embed, Media(row[0], row[1], row[2]))
     except discord.HTTPException as exc:
-        print(f"Failed to post highlight: {exc}")
+        log.warning("Failed to post highlight: %s", exc)
 
 
 async def finish_accept(interaction: discord.Interaction, review_message: discord.Message,
@@ -219,6 +222,7 @@ async def finish_accept(interaction: discord.Interaction, review_message: discor
         return
     cursor.execute("UPDATE teams SET points=points+? WHERE id=?", (awarded, team_id))
     db.commit()
+    log.info("ACCEPTED team %s task %s for %s pts by %s", team_id, task_id, awarded, interaction.user)
 
     await interaction.response.send_message(f"✅ Task accepted ({awarded} pts).", ephemeral=True)
     await close_review_message(
@@ -287,6 +291,7 @@ class DenyModal(discord.ui.Modal, title="Reason for Denial"):
             await close_review_message(self.review_message, "Already reviewed", discord.Color.dark_grey())
             return
 
+        log.info("DENIED team %s task %s by %s: %s", self.team_id, self.task_id, interaction.user, self.reason.value)
         await interaction.response.send_message("Submission denied.", ephemeral=True)
         await close_review_message(
             self.review_message,
@@ -444,7 +449,7 @@ async def handle_submission(interaction: discord.Interaction, task_id: int) -> N
             interaction.client, channel, embed, media, view=make_review_view(team_id, task_id)
         )
     except discord.HTTPException as exc:
-        print(f"Failed to post submission for review: {exc}")
+        log.error("Failed to post submission (team %s, task %s) for review: %s", team_id, task_id, exc)
         await _say(interaction, "❌ Couldn't send your submission to the judges. Pick the task in `/my_tasks` and try again.")
         return
 
@@ -463,6 +468,10 @@ async def handle_submission(interaction: discord.Interaction, task_id: int) -> N
     )
     db.commit()
 
+    log.info(
+        "SUBMITTED team %s task %s by %s (%s, %s)", team_id, task_id, user,
+        "forwarded upload" if media.channel_id else "link", "resubmission" if is_resubmission else "new",
+    )
     await _say(interaction, f"📩 **#{task_id} · {desc}** sent for review! You'll get a DM when it's judged.")
 
     # Keep teammates in sync so they don't redo the same task.
@@ -561,6 +570,7 @@ def setup_game(tree: app_commands.CommandTree):
             return
 
         set_active_location(location)
+        log.info("GAME STARTED at location %s by %s", location, interaction.user)
 
         cursor.execute("SELECT DISTINCT discord_id FROM users")
         user_ids = [discord_id for (discord_id,) in cursor.fetchall()]
@@ -586,6 +596,7 @@ def setup_game(tree: app_commands.CommandTree):
         else:
             user_ids = get_team_member_ids(team_id)
         delivered = await dm_many(interaction.client, user_ids, f"📣 **Announcement**\n{message}")
+        log.info("ANNOUNCE by %s to %d/%d players: %s", interaction.user, delivered, len(user_ids), message)
         await interaction.followup.send(f"Delivered to {delivered}/{len(user_ids)} players.", ephemeral=True)
 
     @tree.command(name="queue", description="Show submissions waiting for review")
@@ -633,6 +644,47 @@ def setup_game(tree: app_commands.CommandTree):
         added, updated, error = await load_tasks_from_sheet(sheet_name)
         message = error or f"Loaded {sheet_name}: {added} new tasks, {updated} updated."
         await interaction.followup.send(message, ephemeral=True)
+
+    @tree.command(name="delete_all_tasks", description="Delete every task (and its submissions) so you can reload the sheet")
+    @app_commands.describe(confirm="Type DELETE to confirm. This can't be undone.")
+    @app_commands.guild_only()
+    async def delete_all_tasks(interaction: discord.Interaction, confirm: str):
+        if await reject_if_not_admin(interaction):
+            return
+        if confirm.strip() != "DELETE":
+            await interaction.response.send_message(
+                "Nothing deleted. Type `DELETE` (all caps) in the confirm box to wipe every task.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        cursor.execute("SELECT message_id FROM submissions WHERE status='Pending' AND message_id IS NOT NULL")
+        pending_reviews = [message_id for (message_id,) in cursor.fetchall()]
+        cursor.execute("SELECT COUNT(*) FROM tasks")
+        task_count = cursor.fetchone()[0]
+        # Submissions go too: task IDs restart at 1 after a wipe, so old submissions would
+        # otherwise attach themselves to the newly loaded tasks. Team points are kept.
+        cursor.execute("DELETE FROM submissions")
+        cursor.execute("DELETE FROM tasks")
+        db.commit()
+        pending_picks.clear()
+        log.warning("DELETED ALL %d tasks and their submissions (by %s)", task_count, interaction.user)
+
+        # Stamp reviews that were still waiting so judges don't act on deleted tasks.
+        channel = interaction.client.get_channel(config.get("moderator_channel") or 0)
+        if channel is not None:
+            for message_id in pending_reviews:
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.HTTPException:
+                    continue
+                await close_review_message(message, "Task deleted by a Game Admin", discord.Color.dark_grey())
+
+        await interaction.followup.send(
+            f"🗑️ Deleted {task_count} task{'s' if task_count != 1 else ''} and all their submissions "
+            "(team points were kept). Run `/load_tasks` to load the sheet again.",
+            ephemeral=True,
+        )
 
     # --- My Tasks ---
     @tree.command(name="my_tasks", description="View your tasks for the current location")

@@ -23,6 +23,7 @@ PLAYER_HELP = (
 
 ADMIN_HELP = (
     "**Setup:** `/load_tasks` (safe to re-run) → `/create_team` (DMs members how to play) → `/start_game`\n"
+    "**Start over:** `/delete_all_tasks confirm:DELETE` wipes tasks and submissions (keeps points), then `/load_tasks`\n"
     "**Live:** `/live_leaderboard` in a channel, `/announce`, `/queue` for pending reviews\n"
     "**Teams:** `/list_teams`, `/rename_team`, `/remove_team`\n"
     "**Scoring:** Accept/Deny in the moderator channel, `/add_points`, `/remove_points`\n"

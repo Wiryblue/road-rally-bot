@@ -1,6 +1,9 @@
+import logging
 import asyncio
 
 import discord
+
+log = logging.getLogger("rally.utils")
 
 # Keep bulk DMs from tripping Discord's rate limits.
 DM_CONCURRENCY = 5
@@ -23,7 +26,7 @@ async def dm_user(client: discord.Client, user_id: int, content: str | None = No
         await user.send(content, **kwargs)
         return True
     except discord.HTTPException as exc:
-        print(f"Failed to DM user {user_id}: {exc}")
+        log.warning("Failed to DM user %s: %s", user_id, exc)
         return False
 
 

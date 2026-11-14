@@ -1,3 +1,4 @@
+import logging
 import discord
 from discord import app_commands
 from typing import Optional, List
@@ -5,6 +6,8 @@ from typing import Optional, List
 from database import cursor, db, add_user_to_team, get_team_id
 from commands.leaderboard import leaderboard_visible, request_leaderboard_refresh
 from utils import reject_if_not_admin, chunk_lines
+
+log = logging.getLogger("rally.teams")
 
 
 async def _gather_member_names(interaction: discord.Interaction, team_id: int) -> List[str]:
@@ -99,6 +102,7 @@ def setup_teams(tree: app_commands.CommandTree):
             added_ids.append(user.id)
 
         db.commit()
+        log.info("TEAM CREATED %r (id %s) by %s: added %s, skipped %s", team_name, team_id, interaction.user, added_users, duplicate_users)
 
         response = [f"Team '{team_name}' created successfully! (ID: {team_id})"]
         response.append("Added members: " + (", ".join(added_users) if added_users else "None"))
@@ -152,6 +156,7 @@ def setup_teams(tree: app_commands.CommandTree):
 
         cursor.execute("UPDATE teams SET name = ? WHERE id = ?", (new_name, team_id))
         db.commit()
+        log.info("TEAM RENAMED id %s to %r by %s", team_id, new_name, interaction.user)
         await interaction.followup.send(f"Team renamed successfully to '{new_name}'.", ephemeral=True)
         request_leaderboard_refresh(interaction.client)
 
@@ -173,6 +178,7 @@ def setup_teams(tree: app_commands.CommandTree):
         cursor.execute("DELETE FROM users WHERE team_id = ?", (team_id,))
         cursor.execute("DELETE FROM submissions WHERE team_id = ?", (team_id,))
         db.commit()
+        log.warning("TEAM REMOVED %r (id %s) by %s", team[0], team_id, interaction.user)
         await interaction.followup.send(f"Team '{team[0]}' and its members have been removed.", ephemeral=True)
         request_leaderboard_refresh(interaction.client)
 

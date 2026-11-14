@@ -1,7 +1,10 @@
+import logging
 import asyncio
 
 from config import get_gclient
 from database import cursor, db
+
+log = logging.getLogger("rally.sheets")
 
 
 def _fetch_rows(sheet_name: str):
@@ -18,7 +21,7 @@ async def load_tasks_from_sheet(sheet_name: str) -> tuple[int, int, str | None]:
     try:
         rows = await asyncio.to_thread(_fetch_rows, sheet_name)
     except Exception as e:
-        print(f"Error loading tasks: {e}")
+        log.exception("Error loading tasks from sheet %r", sheet_name)
         return 0, 0, f"Couldn't open the sheet ({type(e).__name__}). Check the name and that it's shared with the service account."
 
     # Validate everything first so a bad row doesn't leave a half-imported sheet.
@@ -45,4 +48,5 @@ async def load_tasks_from_sheet(sheet_name: str) -> tuple[int, int, str | None]:
             )
             added += 1
     db.commit()
+    log.info("Loaded sheet %r: %d added, %d updated", sheet_name, added, updated)
     return added, updated, None
